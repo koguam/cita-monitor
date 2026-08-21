@@ -173,6 +173,22 @@ def classify(pg, text):
     return None
 
 
+def offices_on_offer(pg):
+    """Names of the offices the site is offering, read off the page we already
+    have. Tells the human where the slot is without costing another request."""
+    try:
+        names = pg.eval_on_selector_all(
+            "#idSede option", "els => els.map(e => e.textContent)")
+    except Exception:
+        return []
+    out = []
+    for n in names:
+        n = (n or "").strip()
+        if n and "eleccionar" not in n and "ualquier" not in n:
+            out.append(n)
+    return out
+
+
 def settle(pg, timeout=25000):
     """Wait for subresources, not just the HTML.
 
@@ -320,7 +336,7 @@ def check_once(save_html=None):
             if verdict == NO_SLOTS:
                 return NO_SLOTS, "no slots"
             if verdict == AVAILABLE:
-                return AVAILABLE, text[:600]
+                return AVAILABLE, offices_on_offer(pg)
             try:
                 log("stuck-page structure: " + str(pg.evaluate(
                     "() => ({url: location.href,"
@@ -342,17 +358,22 @@ def check_once(save_html=None):
                 pass
 
 
-def notify_available(detail):
+def notify_available(offices):
     url = f"{BASE}/{CATEGORY}/citar?p={PROVINCE}"
+    where = ""
+    if offices:
+        where = "\n🏢 <b>Вільні офіси:</b>\n" + "\n".join(f"  • {o}" for o in offices) + "\n"
     send_telegram(
         "🚨 <b>Є СЛОТИ НА CITA PREVIA!</b>\n\n"
         f"📍 <b>{PROVINCE_NAME}</b>\n"
         f"📋 {TRAMITE_NAME}\n"
-        f"👤 {FULL_NAME} — {NIE}\n\n"
-        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC\n\n"
-        f"➡️ <a href=\"{url}\">Відкрити сайт і записатись</a>\n\n"
-        "<i>Бот тільки перевіряє наявність — бронювати треба вручну, "
-        "підтвердження приходить SMS-кодом.</i>"
+        f"👤 {FULL_NAME} — {NIE}\n"
+        f"{where}\n"
+        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC — біжи зараз, "
+        "слоти розбирають за хвилини\n\n"
+        f"➡️ <a href=\"{url}\">Відкрити сайт</a>  (потрібен іспанський VPN)\n\n"
+        "<i>Дату видно вже на сайті, після вибору офісу. Бот туди не заходить, "
+        "щоб не займати слот — бронювання і SMS-код лишаються за тобою.</i>"
     )
 
 
@@ -374,7 +395,7 @@ def main():
         status, detail = check_once()
 
         if status == AVAILABLE:
-            log(f"*** SLOTS AVAILABLE *** {detail[:120]}")
+            log(f"*** SLOTS AVAILABLE *** offices={detail}")
             now = time.time()
             if last_status != AVAILABLE or (now - last_notified) > REMIND_AFTER:
                 notify_available(detail)
