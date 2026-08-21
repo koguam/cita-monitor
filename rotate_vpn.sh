@@ -10,6 +10,16 @@ CONF=/etc/openvpn/es.conf
 
 [ -f "$CONF" ] || { echo "rotate: $CONF missing"; exit 1; }
 
+# Remember the /24 we are leaving: the site appears to reject whole blocks, so
+# the next pick should avoid this one rather than hop within it.
+BLOCKED_FILE="${BLOCKED_FILE:-/tmp/cita_blocked_subnets.txt}"
+OLD_IP=$(awk '/^remote /{print $2; exit}' "$CONF")
+if [ -n "${OLD_IP:-}" ]; then
+  echo "${OLD_IP%.*}" >> "$BLOCKED_FILE"
+  echo "rotate: marking ${OLD_IP%.*}.0/24 as burned"
+fi
+export BLOCKED_FILE
+
 sudo pkill -f "openvpn --config $CONF" 2>/dev/null || true
 sleep 2
 
