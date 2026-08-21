@@ -142,6 +142,37 @@ def wait_for(pg, selector, where, timeout=30000):
                            f"(page starts: {body_of(pg)[:160]!r})")
 
 
+NO_SLOT_MARKERS = (
+    "no hay citas disponibles",
+    "En este momento no hay citas",
+)
+
+
+def classify(pg, text):
+    """Decide what the post-solicitud page is saying, or None if not there yet.
+
+    Structure beats wording: the office dropdown (#idSede) and the slot radios
+    only exist when there is something bookable, whereas the exact Spanish
+    sentence around them varies between trámites and site versions.
+    """
+    low = text.lower()
+    if any(m.lower() in low for m in NO_SLOT_MARKERS):
+        return NO_SLOTS
+
+    try:
+        if pg.query_selector("#idSede") or pg.query_selector(
+                "input[type=radio][name=rdbCita]"):
+            return AVAILABLE
+    except Exception:
+        pass
+
+    if ("seleccione la oficina" in low
+            or "citas disponibles" in low
+            or "dispone de 5 minutos" in low):
+        return AVAILABLE
+    return None
+
+
 def settle(pg, timeout=25000):
     """Wait for subresources, not just the HTML.
 
@@ -273,24 +304,22 @@ def check_once(save_html=None):
             # The result page can be slow over the VPN, so poll for a verdict
             # instead of sleeping a fixed amount and hoping.
             deadline = time.time() + 60
-            text = ""
+            text, verdict = "", None
             while time.time() < deadline:
                 text = guard(pg, "result page")
-                if ("En este momento no hay citas disponibles" in text
-                        or "Seleccione la oficina donde solicitar la cita" in text
-                        or "Seleccione una de las siguientes citas disponibles" in text
-                        or "DISPONE DE 5 MINUTOS" in text):
+                verdict = classify(pg, text)
+                if verdict:
                     break
                 time.sleep(2)
 
             if save_html:
                 open(save_html, "w").write(pg.content())
 
-            if "En este momento no hay citas disponibles" in text:
+            log(f"result page ({pg.url}): {text[:500]!r}")
+
+            if verdict == NO_SLOTS:
                 return NO_SLOTS, "no slots"
-            if ("Seleccione la oficina donde solicitar la cita" in text
-                    or "Seleccione una de las siguientes citas disponibles" in text
-                    or "DISPONE DE 5 MINUTOS" in text):
+            if verdict == AVAILABLE:
                 return AVAILABLE, text[:600]
             try:
                 log("stuck-page structure: " + str(pg.evaluate(
