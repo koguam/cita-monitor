@@ -16,6 +16,12 @@ concurrency:
   group: cita-monitor
   cancel-in-progress: true
 
+env:
+  # icp.administracionelectronica.gob.es lives here (Ministerio de Política
+  # Territorial, ES). Only this range is routed through the VPN.
+  SITE_NET: "185.73.174.0/24"
+  SITE_URL: "https://icp.administracionelectronica.gob.es"
+
 jobs:
   watch:
     runs-on: ubuntu-latest
@@ -39,8 +45,41 @@ jobs:
           fi
           google-chrome --version || true
 
-      - name: Show runner egress IP (geo diagnostics)
-        run: curl -s https://ipinfo.io/json || true
+      - name: Bring up Spanish VPN tunnel
+        env:
+          WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}
+        run: |
+          if [ -z "$WIREGUARD_CONF" ]; then
+            echo "::error::WIREGUARD_CONF secret is empty. The site only accepts"
+            echo "::error::Spanish IPs and GitHub runners are in the US."
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools
+
+          printf '%s\n' "$WIREGUARD_CONF" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+
+          # Split tunnel: send ONLY the cita site through the VPN, so the runner
+          # keeps its own route to GitHub. DNS stays on the runner's resolver.
+          sudo sed -i '/^[[:space:]]*DNS[[:space:]]*=/d' /etc/wireguard/wg0.conf
+          sudo sed -i 's#^[[:space:]]*AllowedIPs[[:space:]]*=.*#AllowedIPs = '"$SITE_NET"'#' \
+            /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          sudo wg-quick up wg0
+          sudo wg show
+
+      - name: Verify the site is reachable through the tunnel
+        run: |
+          echo "Runner egress IP (should stay US - split tunnel):"
+          curl -s --max-time 20 https://ipinfo.io/json || true
+          echo
+          echo "Reaching the cita site through the tunnel:"
+          code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 45 \
+            -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            "$SITE_URL/icpplus/index") || code=000
+          echo "HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::Site unreachable through the VPN"; exit 1; }
 
       - name: Watch for slots
         env:
