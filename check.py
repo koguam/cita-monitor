@@ -100,6 +100,37 @@ def new_browser(p):
         return p.chromium.launch(**kw)
 
 
+def _trigger_solicitud(pg, diag):
+    """Ask for availability. The page's JS bundle does not always load, so fall
+    back from the real button to the JS call to a bare form submit."""
+    attempts = []
+
+    for btn in diag.get("buttons", []):
+        label = f"{btn.get('value') or ''} {btn.get('text') or ''}".lower()
+        if "solicitar" in label and btn.get("id"):
+            attempts.append(("click #" + btn["id"], lambda i=btn["id"]: pg.click("#" + i)))
+            break
+
+    if diag.get("enviar") == "function":
+        attempts.append(("enviar('solicitud')",
+                         lambda: pg.evaluate("enviar('solicitud')")))
+
+    attempts.append(("form submit", lambda: pg.evaluate(
+        "() => { const f = document.forms[0]; if (!f) return false;"
+        "  let m = f.querySelector('[name=method]');"
+        "  if (m) m.value = 'solicitud'; f.submit(); return true; }")))
+
+    for label, action in attempts:
+        try:
+            with pg.expect_navigation(timeout=45000):
+                action()
+            log(f"solicitud triggered via {label}")
+            return True
+        except Exception as e:
+            log(f"solicitud via {label} failed: {type(e).__name__} {str(e)[:100]}")
+    return False
+
+
 def check_once(save_html=None):
     """Run one full check. Returns (status, detail)."""
     with sync_playwright() as p:
@@ -155,11 +186,20 @@ def check_once(save_html=None):
             # 5) identity confirmed -> ask for availability (read-only)
             pg.wait_for_selector("#btnConsultar", timeout=30000)
             sleep_ms(1000, 2000)
-            try:
-                with pg.expect_navigation(timeout=60000):
-                    pg.evaluate("enviar('solicitud')")
-            except Exception:
-                pass  # the poll below is the real check
+
+            diag = pg.evaluate("""() => ({
+                enviar: typeof enviar,
+                buttons: [...document.querySelectorAll(
+                    'input[type=button],input[type=submit],button')].map(e => ({
+                        id: e.id, value: e.value,
+                        onclick: (e.getAttribute('onclick') || '').slice(0, 70),
+                        text: (e.innerText || '').trim().slice(0, 30)})),
+                forms: [...document.forms].map(f => ({id: f.id, action: f.action}))
+            })""")
+            log(f"identity page controls: {diag}")
+
+            if not _trigger_solicitud(pg, diag):
+                return ERROR, f"could not trigger solicitud; controls={diag}"
 
             # The result page can be slow over the VPN, so poll for a verdict
             # instead of sleeping a fixed amount and hoping.
