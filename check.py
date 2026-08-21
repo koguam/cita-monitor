@@ -13,6 +13,7 @@ too often, so the loop detects a block and backs off instead of hammering.
 """
 import os
 import random
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -44,6 +45,8 @@ PROXY_PASS = os.environ.get("PROXY_PASS", "")
 INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "300"))
 REMIND_AFTER = int(os.environ.get("REMIND_AFTER_SECONDS", "1800"))
 LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "0"))
+# Shell command that reconnects the VPN through another Spanish node.
+ROTATE_CMD = os.environ.get("ROTATE_CMD", "")
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -358,6 +361,28 @@ def check_once(save_html=None):
                 pass
 
 
+def rotate_exit_ip():
+    """Hop to a different Spanish exit node. Returns True if the tunnel came
+    back up, in which case the caller can retry promptly instead of retreating.
+
+    A blocked IP stays blocked for a long while, so sitting out the backoff
+    burns most of the monitoring window; a fresh node recovers in seconds.
+    """
+    log("rotating VPN exit node after block")
+    try:
+        r = subprocess.run(ROTATE_CMD, shell=True, timeout=180,
+                           capture_output=True, text=True)
+        for line in (r.stdout or "").splitlines():
+            log("  " + line)
+        if r.returncode != 0:
+            log(f"  rotation failed rc={r.returncode}: {(r.stderr or '')[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log(f"  rotation error: {type(e).__name__} {str(e)[:150]}")
+        return False
+
+
 def notify_available(offices):
     url = f"{BASE}/{CATEGORY}/citar?p={PROVINCE}"
     where = ""
@@ -407,6 +432,12 @@ def main():
         elif status == BLOCKED:
             block_streak += 1
             log(f"BLOCKED by WAF ({block_streak}): {detail}")
+            if ROTATE_CMD and rotate_exit_ip():
+                # Fresh IP, so the long retreat is not needed.
+                block_streak = 0
+                last_status = status
+                time.sleep(random.uniform(30, 60))
+                continue
         else:
             consecutive_errors += 1
             log(f"ERROR ({consecutive_errors}): {detail}")
