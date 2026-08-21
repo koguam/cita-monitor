@@ -142,9 +142,32 @@ def wait_for(pg, selector, where, timeout=30000):
                            f"(page starts: {body_of(pg)[:160]!r})")
 
 
+def settle(pg, timeout=25000):
+    """Wait for subresources, not just the HTML.
+
+    The page's behaviour lives in a JS bundle. Over the VPN the runner is slow
+    enough that domcontentloaded fires long before that bundle arrives, and
+    calling enviar() then throws because it does not exist yet.
+    """
+    for state in ("load", "networkidle"):
+        try:
+            pg.wait_for_load_state(state, timeout=timeout)
+        except Exception:
+            pass
+
+
 def _trigger_solicitud(pg, diag):
     """Ask for availability. The page's JS bundle does not always load, so fall
     back from the real button to the JS call to a bare form submit."""
+    # Give the bundle a last chance to define enviar() before deciding.
+    if diag.get("enviar") != "function":
+        try:
+            pg.wait_for_function("() => typeof enviar === 'function'", timeout=15000)
+            diag["enviar"] = "function"
+            log("enviar() showed up after waiting for the JS bundle")
+        except Exception:
+            log("enviar() still undefined after waiting; using fallbacks")
+
     attempts = []
 
     for btn in diag.get("buttons", []):
@@ -193,12 +216,14 @@ def check_once(save_html=None):
             # 1) province page (also clears the F5 JS challenge)
             pg.goto(f"{BASE}/{CATEGORY}/citar?p={PROVINCE}",
                     wait_until="domcontentloaded", timeout=90000)
+            settle(pg)
             sleep_ms(4000, 7000)
             guard(pg, "province page")
 
             # 2) jump straight to the trámite (skips the select/submit dance)
             pg.goto(f"{BASE}/{CATEGORY}/acInfo?{TRAMITE_PARAM}={TRAMITE}",
                     wait_until="domcontentloaded", timeout=90000)
+            settle(pg)
             sleep_ms(4000, 7000)
             text = guard(pg, "tramite page")
             if "CITA PREVIA" not in text.upper():
@@ -209,6 +234,7 @@ def check_once(save_html=None):
             sleep_ms(1500, 3000)
             pg.click("#btnEntrar")
             pg.wait_for_load_state("domcontentloaded")
+            settle(pg)
             sleep_ms(3000, 5000)
 
             # 4) identity form (fields refuse paste -> type it)
@@ -221,6 +247,7 @@ def check_once(save_html=None):
             sleep_ms(2500, 4500)
             pg.click("#btnEnviar")
             pg.wait_for_load_state("domcontentloaded")
+            settle(pg)
             sleep_ms(3000, 5000)
 
             # 5) identity confirmed -> ask for availability (read-only)

@@ -125,7 +125,7 @@ jobs:
           TRAMITE: "4112"
           TRAMITE_PARAM: "tramiteGrupo[1]"
           TRAMITE_NAME: "POLICÍA TARJETA CONFLICTO UCRANIA"
-          INTERVAL_SECONDS: "180"
+          INTERVAL_SECONDS: "300"
           REMIND_AFTER_SECONDS: "1800"
           LOOP_MINUTES: ${{ github.event.inputs.single_check == 'true' && '0' || '350' }}
         run: python check.py
