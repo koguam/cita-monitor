@@ -1,0 +1,63 @@
+name: cita-monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      single_check:
+        description: "Run one check only (diagnostic) instead of the long loop"
+        type: boolean
+        default: false
+  schedule:
+    # Restarts the self-looping job hourly. GitHub heavily deprioritises
+    # short-interval crons, so the job does its own internal looping.
+    - cron: "7 * * * *"
+
+concurrency:
+  group: cita-monitor
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Ensure Google Chrome is present
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            echo "google-chrome missing, installing via playwright"
+            python -m playwright install chrome
+          fi
+          google-chrome --version || true
+
+      - name: Show runner egress IP (geo diagnostics)
+        run: curl -s https://ipinfo.io/json || true
+
+      - name: Watch for slots
+        env:
+          NIE: ${{ secrets.NIE }}
+          FULL_NAME: ${{ secrets.FULL_NAME }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_IDS: ${{ secrets.CHAT_IDS }}
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USER: ${{ secrets.PROXY_USER }}
+          PROXY_PASS: ${{ secrets.PROXY_PASS }}
+          PROVINCE: "43"
+          PROVINCE_NAME: "Tarragona"
+          CATEGORY: "icpplus"
+          TRAMITE: "4112"
+          TRAMITE_PARAM: "tramiteGrupo[1]"
+          TRAMITE_NAME: "POLICÍA TARJETA CONFLICTO UCRANIA"
+          INTERVAL_SECONDS: "300"
+          REMIND_AFTER_SECONDS: "1800"
+          LOOP_MINUTES: ${{ inputs.single_check && '0' || '350' }}
+        run: python check.py

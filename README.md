@@ -1,0 +1,96 @@
+# cita-monitor
+
+Telegram-уведомления о свободных слотах **cita previa** в испанской
+Sede Electrónica (Extranjería / CNP).
+
+Настроен на **Таррагону**, трámite
+**POLICÍA TARJETA CONFLICTO UCRANIA** (`4112`) — карта для перемещённых лиц
+из Украины.
+
+Бот **только проверяет наличие** слотов и присылает уведомление.
+Он ничего не бронирует: выбор времени и подтверждение SMS-кодом остаются
+ручным шагом.
+
+## Как это работает
+
+Сайт закрыт F5-вафом с JS-челленджем и FortiGate IPS, поэтому проверка идёт
+через настоящий Google Chrome под Playwright (обычный headless-shell от
+Playwright блокируется — нужен именно Chrome).
+
+Цикл одной проверки:
+
+1. `GET /icpplus/citar?p=43` — страница провинции, попутно проходится
+   JS-челлендж F5.
+2. `GET /icpplus/acInfo?tramiteGrupo[1]=4112` — сразу нужный трámite,
+   минуя всю возню с выпадающими списками.
+3. Кнопка **Entrar** → форма личных данных (NIE + имя, поля запрещают вставку,
+   поэтому текст набирается посимвольно).
+4. `enviar('solicitud')` — запрос доступности.
+5. Разбор результата:
+   - `En este momento no hay citas disponibles` → слотов нет;
+   - `Seleccione la oficina donde solicitar la cita` → **слоты есть**, летит
+     уведомление в Telegram.
+
+## Расписание
+
+GitHub сильно занижает приоритет частых cron-расписаний, поэтому используется
+один самозацикленный job: он крутится внутри себя до ~6 часов
+(`LOOP_MINUTES=350`), проверяя раз в 5 минут, и перезапускается ежечасным
+cron'ом как страховка. `concurrency: cancel-in-progress` не даёт им
+наслаиваться.
+
+Интервал 5 минут выбран намеренно: это госсайт, долбить его чаще
+невежливо и чревато блокировкой IP.
+
+## Секреты
+
+Все чувствительные данные живут в **GitHub Secrets**, в репозитории их нет:
+
+| Secret | Что это |
+|---|---|
+| `NIE` | NIE заявителя |
+| `FULL_NAME` | Имя и фамилия как в заявке |
+| `TELEGRAM_TOKEN` | Токен бота от @BotFather |
+| `CHAT_IDS` | ID получателей через запятую |
+| `PROXY_SERVER` | *(необязательно)* испанский прокси, если IP раннера заблокирован |
+| `PROXY_USER` / `PROXY_PASS` | *(необязательно)* авторизация прокси |
+
+## Запуск локально
+
+```bash
+pip install -r requirements.txt
+NIE=X1234567Z FULL_NAME="IMYA FAMILIYA" \
+TELEGRAM_TOKEN=... CHAT_IDS=... \
+python check.py
+```
+
+Без `LOOP_MINUTES` делается одна проверка и скрипт завершается.
+
+## Управление
+
+```bash
+gh workflow run monitor.yml --repo <owner>/cita-monitor
+```
+
+Одиночная диагностическая проверка (покажет IP раннера и результат):
+
+```bash
+gh workflow run monitor.yml --repo <owner>/cita-monitor -f single_check=true
+```
+
+Остановить: отменить текущий run **и** выключить workflow — одного
+`disable` мало, уже запущенный цикл он не прервёт.
+
+```bash
+gh workflow disable monitor.yml --repo <owner>/cita-monitor
+```
+
+## Другие провинции и трámite
+
+`PROVINCE` — код провинции (Таррагона = 43), `TRAMITE` — код из выпадающего
+списка. Для Таррагоны список полицейских трámite лежит в `tramiteGrupo[1]`;
+в части провинций (Барселона, Мадрид, Малага, Севилья, Мелилья) индекс и
+категория URL отличаются — см. `CATEGORY` / `TRAMITE_PARAM`.
+
+Второй украинский трámite в Таррагоне:
+`4111` — POLICÍA - UCRANIA : SOLICITUD PROTECCIÓN TEMPORAL DESPLAZADOS.
