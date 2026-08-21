@@ -49,6 +49,7 @@ REMIND_AFTER = int(os.environ.get("REMIND_AFTER_SECONDS", "1800"))
 LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "0"))
 # Shell command that reconnects the VPN through another Spanish node.
 ROTATE_CMD = os.environ.get("ROTATE_CMD", "")
+MAX_ROTATIONS = int(os.environ.get("MAX_ROTATIONS", "4"))
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -444,6 +445,7 @@ def main():
     last_notified = 0.0
     consecutive_errors = 0
     block_streak = 0
+    rotations = 0
 
     while True:
         status, detail = check_once()
@@ -461,12 +463,19 @@ def main():
         elif status == BLOCKED:
             block_streak += 1
             log(f"BLOCKED by WAF ({block_streak}): {detail}")
-            if ROTATE_CMD and rotate_exit_ip():
-                # Fresh IP, so the long retreat is not needed.
+            # Rotating is cheap but not free: each hop opens a VPN session, and
+            # 14 hops in 25 minutes got the account's logins refused outright.
+            # Past a few fruitless hops the address is clearly not the problem,
+            # so stop burning sessions and wait instead.
+            if ROTATE_CMD and rotations < MAX_ROTATIONS and rotate_exit_ip():
+                rotations += 1
                 block_streak = 0
                 last_status = status
                 time.sleep(random.uniform(30, 60))
                 continue
+            if rotations >= MAX_ROTATIONS:
+                log(f"{rotations} rotations without luck — the exit IP is not "
+                    f"the problem; waiting it out instead")
         else:
             consecutive_errors += 1
             log(f"ERROR ({consecutive_errors}): {detail}")
