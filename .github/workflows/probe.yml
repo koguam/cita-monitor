@@ -8,7 +8,7 @@ on:
     inputs:
       tramites:
         description: "Space-separated trámite codes to sweep"
-        default: "4097 4037 20 4038 4049 4031"
+        default: "4097"
       province:
         description: "Province code (43 = Tarragona)"
         default: "43"
@@ -85,6 +85,7 @@ jobs:
           echo "=============== SWEEP RESULTS ==============="
           for t in ${{ github.event.inputs.tramites }}; do
             echo "--- trámite $t ---"
-            TRAMITE="$t" python check.py 2>&1 | grep -E "RESULT:|BLOCKED|ERROR \(|no slots|SLOTS AVAILABLE" || true
-            sleep 45
+            # No grep here: the identity-page control dump is the whole point.
+            TRAMITE="$t" python check.py 2>&1 || true
+            sleep 90
           done

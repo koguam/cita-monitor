@@ -238,8 +238,10 @@ def check_once(save_html=None):
             })""")
             log(f"identity page controls: {diag}")
 
+            log(f"identity page url: {pg.url}")
             if not _trigger_solicitud(pg, diag):
                 return ERROR, f"could not trigger solicitud; controls={diag}"
+            log(f"after solicitud url: {pg.url}")
 
             # The result page can be slow over the VPN, so poll for a verdict
             # instead of sleeping a fixed amount and hoping.
@@ -263,6 +265,15 @@ def check_once(save_html=None):
                     or "Seleccione una de las siguientes citas disponibles" in text
                     or "DISPONE DE 5 MINUTOS" in text):
                 return AVAILABLE, text[:600]
+            try:
+                log("stuck-page structure: " + str(pg.evaluate(
+                    "() => ({url: location.href,"
+                    " forms: [...document.forms].map(f => ({id: f.id, name: f.name,"
+                    "   action: f.action, method: f.method,"
+                    "   fields: [...f.elements].map(e => e.name + ':' + e.type)})),"
+                    " scripts: [...document.scripts].map(s => s.src).filter(Boolean)})")))
+            except Exception:
+                pass
             return ERROR, f"unrecognised result page: {text[:300]!r}"
         except Blocked as e:
             return BLOCKED, str(e)
