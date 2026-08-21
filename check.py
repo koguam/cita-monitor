@@ -13,6 +13,7 @@ too often, so the loop detects a block and backs off instead of hammering.
 """
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ CATEGORY = os.environ.get("CATEGORY", "icpplus")       # icpplus for Tarragona
 TRAMITE_PARAM = os.environ.get("TRAMITE_PARAM", "tramiteGrupo[1]")
 TRAMITE = os.environ.get("TRAMITE", "4112")            # POLICÍA TARJETA CONFLICTO UCRANIA
 TRAMITE_NAME = os.environ.get("TRAMITE_NAME", "POLICÍA TARJETA CONFLICTO UCRANIA")
+SEDE = os.environ.get("SEDE", "99")                    # 99 = cualquier oficina
 PROVINCE_NAME = os.environ.get("PROVINCE_NAME", "Tarragona")
 
 NIE = os.environ.get("NIE", "")
@@ -263,23 +265,50 @@ def check_once(save_html=None):
         pg = ctx.new_page()
         pg.set_default_timeout(45000)
         try:
-            # 1) province page (also clears the F5 JS challenge)
-            pg.goto(f"{BASE}/{CATEGORY}/citar?p={PROVINCE}",
+            # 1) front door. Deep-linking straight to acInfo works, and is what
+            # the well-known bots do, but the WAF reads it as forced browsing
+            # and starts rejecting the trámite page within a minute even from a
+            # never-used IP. Walking the form is slower and stays welcome.
+            pg.goto(f"{BASE}/{CATEGORY}/index",
                     wait_until="domcontentloaded", timeout=90000)
             settle(pg)
-            sleep_ms(4000, 7000)
+            sleep_ms(3000, 6000)
+            guard(pg, "index page")
+
+            # 2) choose the province the way the page offers it: the option
+            # values are the citar URLs and the button navigates to them.
+            wait_for(pg, "select[name=form]", "province select")
+            province_url = f"/{CATEGORY}/citar?p={PROVINCE}&locale=es"
+            try:
+                pg.select_option("select[name=form]", province_url)
+            except Exception:
+                pg.select_option("select[name=form]",
+                                 label=re.compile(PROVINCE_NAME, re.I))
+            sleep_ms(1500, 3000)
+            pg.click("#btnAceptar")
+            pg.wait_for_load_state("domcontentloaded")
+            settle(pg)
+            sleep_ms(3000, 6000)
             guard(pg, "province page")
 
-            # 2) jump straight to the trámite (skips the select/submit dance)
-            pg.goto(f"{BASE}/{CATEGORY}/acInfo?{TRAMITE_PARAM}={TRAMITE}",
-                    wait_until="domcontentloaded", timeout=90000)
+            # 3) pick office + trámite and submit that form too
+            wait_for(pg, f"select[name='{TRAMITE_PARAM}']", "trámite select")
+            try:
+                pg.select_option("select[name=sede]", SEDE)
+            except Exception:
+                pass
+            sleep_ms(1200, 2500)
+            pg.select_option(f"select[name='{TRAMITE_PARAM}']", TRAMITE)
+            sleep_ms(2000, 4000)
+            pg.click("#btnAceptar")
+            pg.wait_for_load_state("domcontentloaded")
             settle(pg)
-            sleep_ms(4000, 7000)
+            sleep_ms(3000, 6000)
             text = guard(pg, "tramite page")
             if "CITA PREVIA" not in text.upper():
                 return ERROR, f"unexpected page: {text[:200]!r}"
 
-            # 3) instructions page -> Entrar
+            # 4) instructions page -> Entrar
             wait_for(pg, "#btnEntrar", "instructions page")
             sleep_ms(1500, 3000)
             pg.click("#btnEntrar")
