@@ -61,20 +61,6 @@ jobs:
 
           printf '%s\n' "$OVPN_CONFIG" | sudo tee /etc/openvpn/es.conf > /dev/null
 
-          # Rotate the exit IP: NordVPN shares one CA and tls-crypt key across
-          # its fleet, so pointing the same config at another Spanish server is
-          # just two lines. Each job restart therefore egresses from a new IP.
-          PORT=$(awk '/^remote /{print $3; exit}' /etc/openvpn/es.conf)
-          PICK=$(python3 pick_server.py) || PICK=""
-          if [ -n "$PICK" ]; then
-            IP=${PICK% *}; HOST=${PICK#* }
-            echo "Rotating exit node to $HOST ($IP)"
-            sudo sed -i "s#^remote .*#remote $IP ${PORT:-1194}#" /etc/openvpn/es.conf
-            sudo sed -i "s#^verify-x509-name .*#verify-x509-name CN=$HOST#" /etc/openvpn/es.conf
-          else
-            echo "Server list unavailable, keeping the config's own server"
-          fi
-
           # NordVPN "service credentials" — not the account login.
           printf '%s\n%s\n' "$OVPN_USER" "$OVPN_PASS" | sudo tee /etc/openvpn/creds > /dev/null
           sudo chmod 600 /etc/openvpn/creds
@@ -84,19 +70,13 @@ jobs:
           sudo sed -i '/^[[:space:]]*auth-user-pass/d' /etc/openvpn/es.conf
           printf '%s\n' \
             'auth-user-pass /etc/openvpn/creds' \
+            'auth-nocache' \
             'route-nopull' \
             "route ${SITE_NET%/*} 255.255.255.0" \
             | sudo tee -a /etc/openvpn/es.conf > /dev/null
 
-          sudo openvpn --config /etc/openvpn/es.conf --daemon --log /tmp/ovpn.log
-          for i in $(seq 1 30); do
-            ip route | grep -q "${SITE_NET%/*}" && break
-            sleep 2
-          done
-          if ! ip route | grep -q "${SITE_NET%/*}"; then
-            echo "::error::VPN route never came up"; sudo cat /tmp/ovpn.log; exit 1
-          fi
-          echo "Tunnel up. Route to the site:"; ip route | grep "${SITE_NET%/*}"
+          bash connect_vpn.sh
+          echo "Route to the site:"; ip route | grep "${SITE_NET%/*}"
 
       - name: Verify the site is reachable through the tunnel
         run: |

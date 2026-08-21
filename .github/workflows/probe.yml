@@ -51,28 +51,14 @@ jobs:
           sudo apt-get install -y -qq openvpn
           printf '%s\n' "$OVPN_CONFIG" | sudo tee /etc/openvpn/es.conf > /dev/null
 
-          PORT=$(awk '/^remote /{print $3; exit}' /etc/openvpn/es.conf)
-          PICK=$(python3 pick_server.py) || PICK=""
-          if [ -n "$PICK" ]; then
-            IP=${PICK% *}; HOST=${PICK#* }
-            echo "Exit node: $HOST ($IP)"
-            sudo sed -i "s#^remote .*#remote $IP ${PORT:-1194}#" /etc/openvpn/es.conf
-            sudo sed -i "s#^verify-x509-name .*#verify-x509-name CN=$HOST#" /etc/openvpn/es.conf
-          fi
-
           printf '%s\n%s\n' "$OVPN_USER" "$OVPN_PASS" | sudo tee /etc/openvpn/creds > /dev/null
           sudo chmod 600 /etc/openvpn/creds
           sudo sed -i '/^[[:space:]]*auth-user-pass/d' /etc/openvpn/es.conf
-          printf '%s\n' 'auth-user-pass /etc/openvpn/creds' 'route-nopull' \
-            "route ${SITE_NET%/*} 255.255.255.0" | sudo tee -a /etc/openvpn/es.conf > /dev/null
+          printf '%s\n' 'auth-user-pass /etc/openvpn/creds' 'auth-nocache' \
+            'route-nopull' "route ${SITE_NET%/*} 255.255.255.0" \
+            | sudo tee -a /etc/openvpn/es.conf > /dev/null
 
-          sudo openvpn --config /etc/openvpn/es.conf --daemon --log /tmp/ovpn.log
-          for i in $(seq 1 30); do
-            ip route | grep -q "${SITE_NET%/*}" && break
-            sleep 2
-          done
-          ip route | grep -q "${SITE_NET%/*}" || { sudo cat /tmp/ovpn.log; exit 1; }
-          echo "Tunnel up."
+          bash connect_vpn.sh
 
       - name: Sweep trámites
         env:
