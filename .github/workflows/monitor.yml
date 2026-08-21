@@ -47,27 +47,42 @@ jobs:
 
       - name: Bring up Spanish VPN tunnel
         env:
-          WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          OVPN_USER: ${{ secrets.OVPN_USER }}
+          OVPN_PASS: ${{ secrets.OVPN_PASS }}
         run: |
-          if [ -z "$WIREGUARD_CONF" ]; then
-            echo "::error::WIREGUARD_CONF secret is empty. The site only accepts"
-            echo "::error::Spanish IPs and GitHub runners are in the US."
+          if [ -z "$OVPN_CONFIG" ] || [ -z "$OVPN_USER" ]; then
+            echo "::error::OVPN_CONFIG / OVPN_USER secrets are empty. The site only"
+            echo "::error::accepts Spanish IPs and GitHub runners are in the US."
             exit 1
           fi
           sudo apt-get update -qq
-          sudo apt-get install -y -qq wireguard-tools
+          sudo apt-get install -y -qq openvpn
 
-          printf '%s\n' "$WIREGUARD_CONF" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          printf '%s\n' "$OVPN_CONFIG" | sudo tee /etc/openvpn/es.conf > /dev/null
 
-          # Split tunnel: send ONLY the cita site through the VPN, so the runner
-          # keeps its own route to GitHub. DNS stays on the runner's resolver.
-          sudo sed -i '/^[[:space:]]*DNS[[:space:]]*=/d' /etc/wireguard/wg0.conf
-          sudo sed -i 's#^[[:space:]]*AllowedIPs[[:space:]]*=.*#AllowedIPs = '"$SITE_NET"'#' \
-            /etc/wireguard/wg0.conf
-          sudo chmod 600 /etc/wireguard/wg0.conf
+          # NordVPN "service credentials" — not the account login.
+          printf '%s\n%s\n' "$OVPN_USER" "$OVPN_PASS" | sudo tee /etc/openvpn/creds > /dev/null
+          sudo chmod 600 /etc/openvpn/creds
 
-          sudo wg-quick up wg0
-          sudo wg show
+          # Split tunnel: drop every route the server pushes (route-nopull) and
+          # add back only the cita site, so the runner keeps its path to GitHub.
+          sudo sed -i '/^[[:space:]]*auth-user-pass/d' /etc/openvpn/es.conf
+          printf '%s\n' \
+            'auth-user-pass /etc/openvpn/creds' \
+            'route-nopull' \
+            "route ${SITE_NET%/*} 255.255.255.0" \
+            | sudo tee -a /etc/openvpn/es.conf > /dev/null
+
+          sudo openvpn --config /etc/openvpn/es.conf --daemon --log /tmp/ovpn.log
+          for i in $(seq 1 30); do
+            ip route | grep -q "${SITE_NET%/*}" && break
+            sleep 2
+          done
+          if ! ip route | grep -q "${SITE_NET%/*}"; then
+            echo "::error::VPN route never came up"; sudo cat /tmp/ovpn.log; exit 1
+          fi
+          echo "Tunnel up. Route to the site:"; ip route | grep "${SITE_NET%/*}"
 
       - name: Verify the site is reachable through the tunnel
         run: |
