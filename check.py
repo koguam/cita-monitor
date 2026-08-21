@@ -332,6 +332,7 @@ def main():
         last_status = status
 
         if not LOOP_MINUTES:
+            log(f"RESULT: {status} tramite={TRAMITE} province={PROVINCE}")
             return 0 if status in (AVAILABLE, NO_SLOTS) else 1
         if time.time() >= deadline:
             log("loop window finished")

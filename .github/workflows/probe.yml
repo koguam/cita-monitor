@@ -1,0 +1,90 @@
+name: probe
+
+# Diagnostic only: sweeps several trámites to prove the "slots found" branch
+# actually fires, not just the "no slots" one. Never notifies Telegram.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tramites:
+        description: "Space-separated trámite codes to sweep"
+        default: "4097 4037 20 4038 4049 4031"
+      province:
+        description: "Province code (43 = Tarragona)"
+        default: "43"
+
+concurrency:
+  group: cita-monitor
+  cancel-in-progress: true
+
+env:
+  SITE_NET: "185.73.174.0/24"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ensure Google Chrome is present
+        run: |
+          command -v google-chrome >/dev/null 2>&1 || python -m playwright install chrome
+          google-chrome --version || true
+
+      - name: Bring up Spanish VPN tunnel
+        env:
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          OVPN_USER: ${{ secrets.OVPN_USER }}
+          OVPN_PASS: ${{ secrets.OVPN_PASS }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openvpn
+          printf '%s\n' "$OVPN_CONFIG" | sudo tee /etc/openvpn/es.conf > /dev/null
+
+          PORT=$(awk '/^remote /{print $3; exit}' /etc/openvpn/es.conf)
+          PICK=$(python3 pick_server.py) || PICK=""
+          if [ -n "$PICK" ]; then
+            IP=${PICK% *}; HOST=${PICK#* }
+            echo "Exit node: $HOST ($IP)"
+            sudo sed -i "s#^remote .*#remote $IP ${PORT:-1194}#" /etc/openvpn/es.conf
+            sudo sed -i "s#^verify-x509-name .*#verify-x509-name CN=$HOST#" /etc/openvpn/es.conf
+          fi
+
+          printf '%s\n%s\n' "$OVPN_USER" "$OVPN_PASS" | sudo tee /etc/openvpn/creds > /dev/null
+          sudo chmod 600 /etc/openvpn/creds
+          sudo sed -i '/^[[:space:]]*auth-user-pass/d' /etc/openvpn/es.conf
+          printf '%s\n' 'auth-user-pass /etc/openvpn/creds' 'route-nopull' \
+            "route ${SITE_NET%/*} 255.255.255.0" | sudo tee -a /etc/openvpn/es.conf > /dev/null
+
+          sudo openvpn --config /etc/openvpn/es.conf --daemon --log /tmp/ovpn.log
+          for i in $(seq 1 30); do
+            ip route | grep -q "${SITE_NET%/*}" && break
+            sleep 2
+          done
+          ip route | grep -q "${SITE_NET%/*}" || { sudo cat /tmp/ovpn.log; exit 1; }
+          echo "Tunnel up."
+
+      - name: Sweep trámites
+        env:
+          NIE: ${{ secrets.NIE }}
+          FULL_NAME: ${{ secrets.FULL_NAME }}
+          PROVINCE: ${{ github.event.inputs.province }}
+          CATEGORY: "icpplus"
+          TRAMITE_PARAM: "tramiteGrupo[1]"
+          LOOP_MINUTES: "0"
+          # Telegram deliberately left unset: a probe must never alert.
+        run: |
+          echo "=============== SWEEP RESULTS ==============="
+          for t in ${{ github.event.inputs.tramites }}; do
+            echo "--- trámite $t ---"
+            TRAMITE="$t" python check.py 2>&1 | grep -E "RESULT:|BLOCKED|ERROR \(|no slots|SLOTS AVAILABLE" || true
+            sleep 45
+          done
