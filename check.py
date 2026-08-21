@@ -155,11 +155,29 @@ def check_once(save_html=None):
             # 5) identity confirmed -> ask for availability (read-only)
             pg.wait_for_selector("#btnConsultar", timeout=30000)
             sleep_ms(1000, 2000)
-            pg.evaluate("enviar('solicitud')")
-            pg.wait_for_load_state("domcontentloaded")
-            sleep_ms(3000, 5000)
+            try:
+                with pg.expect_navigation(timeout=60000):
+                    pg.evaluate("enviar('solicitud')")
+            except Exception:
+                pass  # the poll below is the real check
 
-            body = pg.inner_text("body")
+            # The result page can be slow over the VPN, so poll for a verdict
+            # instead of sleeping a fixed amount and hoping.
+            deadline = time.time() + 60
+            body = ""
+            while time.time() < deadline:
+                try:
+                    body = pg.inner_text("body")
+                except Exception:
+                    time.sleep(1)
+                    continue
+                if ("En este momento no hay citas disponibles" in body
+                        or "Seleccione la oficina donde solicitar la cita" in body
+                        or "Seleccione una de las siguientes citas disponibles" in body
+                        or "DISPONE DE 5 MINUTOS" in body):
+                    break
+                time.sleep(2)
+
             if save_html:
                 open(save_html, "w").write(pg.content())
 
