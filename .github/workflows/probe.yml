@@ -14,7 +14,9 @@ on:
         default: "43"
 
 concurrency:
-  group: cita-monitor
+  # Deliberately NOT the monitor's group: a diagnostic run must never cancel
+  # the thing that is actually watching for slots.
+  group: cita-probe
   cancel-in-progress: true
 
 env:
