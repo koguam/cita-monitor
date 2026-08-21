@@ -61,6 +61,20 @@ jobs:
 
           printf '%s\n' "$OVPN_CONFIG" | sudo tee /etc/openvpn/es.conf > /dev/null
 
+          # Rotate the exit IP: NordVPN shares one CA and tls-crypt key across
+          # its fleet, so pointing the same config at another Spanish server is
+          # just two lines. Each job restart therefore egresses from a new IP.
+          PORT=$(awk '/^remote /{print $3; exit}' /etc/openvpn/es.conf)
+          PICK=$(python3 pick_server.py) || PICK=""
+          if [ -n "$PICK" ]; then
+            IP=${PICK% *}; HOST=${PICK#* }
+            echo "Rotating exit node to $HOST ($IP)"
+            sudo sed -i "s#^remote .*#remote $IP ${PORT:-1194}#" /etc/openvpn/es.conf
+            sudo sed -i "s#^verify-x509-name .*#verify-x509-name CN=$HOST#" /etc/openvpn/es.conf
+          else
+            echo "Server list unavailable, keeping the config's own server"
+          fi
+
           # NordVPN "service credentials" — not the account login.
           printf '%s\n%s\n' "$OVPN_USER" "$OVPN_PASS" | sudo tee /etc/openvpn/creds > /dev/null
           sudo chmod 600 /etc/openvpn/creds
@@ -111,7 +125,7 @@ jobs:
           TRAMITE: "4112"
           TRAMITE_PARAM: "tramiteGrupo[1]"
           TRAMITE_NAME: "POLICÍA TARJETA CONFLICTO UCRANIA"
-          INTERVAL_SECONDS: "300"
+          INTERVAL_SECONDS: "180"
           REMIND_AFTER_SECONDS: "1800"
           LOOP_MINUTES: ${{ github.event.inputs.single_check == 'true' && '0' || '350' }}
         run: python check.py
