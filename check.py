@@ -7,6 +7,9 @@ trámite in a single province and pushes a Telegram message when slots appear.
 
 It only ever READS availability. It never books, never picks a slot and never
 submits contact details -- booking stays a manual step for the human.
+
+The site sits behind an F5 WAF that starts rejecting requests if you poke it
+too often, so the loop detects a block and backs off instead of hammering.
 """
 import os
 import random
@@ -33,20 +36,32 @@ FULL_NAME = os.environ.get("FULL_NAME", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_IDS = [c.strip() for c in os.environ.get("CHAT_IDS", "").split(",") if c.strip()]
 
-# Optional Spanish proxy, in case the runner's IP is geo-blocked.
+# Optional Spanish proxy, as an alternative to the VPN hop.
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "")
 PROXY_USER = os.environ.get("PROXY_USER", "")
 PROXY_PASS = os.environ.get("PROXY_PASS", "")
 
-INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "300"))       # between checks
-REMIND_AFTER = int(os.environ.get("REMIND_AFTER_SECONDS", "1800"))  # re-ping while slots hold
-LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "0"))         # 0 = single check
+INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "300"))
+REMIND_AFTER = int(os.environ.get("REMIND_AFTER_SECONDS", "1800"))
+LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "0"))
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 # Result codes
-AVAILABLE, NO_SLOTS, ERROR = "AVAILABLE", "NO_SLOTS", "ERROR"
+AVAILABLE, NO_SLOTS, BLOCKED, ERROR = "AVAILABLE", "NO_SLOTS", "BLOCKED", "ERROR"
+
+BLOCK_MARKERS = (
+    "The requested URL was rejected",
+    "Request Rejected",
+    "support ID is",
+    "FortiGate",
+    "Intrusion Prevention",
+)
+
+
+class Blocked(Exception):
+    """The WAF turned us away."""
 
 
 def log(msg):
@@ -79,8 +94,8 @@ def send_telegram(text):
 
 
 def new_browser(p):
-    """Real Chrome. The default Playwright headless shell is blocked by the
-    site's FortiGate IPS; the real Chrome build passes."""
+    """Real Chrome. Playwright's bundled headless shell is rejected by the
+    FortiGate IPS in front of the site; the real Chrome build passes."""
     args = [
         "--disable-blink-features=AutomationControlled",
         "--ignore-certificate-errors",
@@ -98,6 +113,33 @@ def new_browser(p):
     except Exception as e:
         log(f"channel=chrome unavailable ({e}); falling back to bundled chromium")
         return p.chromium.launch(**kw)
+
+
+def body_of(pg):
+    try:
+        return pg.inner_text("body")
+    except Exception:
+        return ""
+
+
+def guard(pg, where):
+    """Raise if the WAF served a rejection instead of the real page."""
+    text = body_of(pg)
+    for marker in BLOCK_MARKERS:
+        if marker in text:
+            raise Blocked(f"{where}: {marker}")
+    return text
+
+
+def wait_for(pg, selector, where, timeout=30000):
+    """wait_for_selector, but report a WAF block as a block rather than a
+    mystery timeout."""
+    try:
+        pg.wait_for_selector(selector, timeout=timeout)
+    except Exception:
+        guard(pg, where)                     # raises Blocked if that's the cause
+        raise RuntimeError(f"{where}: {selector} never appeared "
+                           f"(page starts: {body_of(pg)[:160]!r})")
 
 
 def _trigger_solicitud(pg, diag):
@@ -151,41 +193,39 @@ def check_once(save_html=None):
             # 1) province page (also clears the F5 JS challenge)
             pg.goto(f"{BASE}/{CATEGORY}/citar?p={PROVINCE}",
                     wait_until="domcontentloaded", timeout=90000)
-            sleep_ms(3000, 5000)
+            sleep_ms(4000, 7000)
+            guard(pg, "province page")
 
             # 2) jump straight to the trámite (skips the select/submit dance)
             pg.goto(f"{BASE}/{CATEGORY}/acInfo?{TRAMITE_PARAM}={TRAMITE}",
                     wait_until="domcontentloaded", timeout=90000)
-            sleep_ms(3000, 5000)
-
-            body = pg.inner_text("body")
-            if "FortiGate" in body or "Request Rejected" in body:
-                return ERROR, "blocked by WAF/IPS"
-            if "CITA PREVIA" not in body.upper():
-                return ERROR, f"unexpected page: {body[:200]!r}"
+            sleep_ms(4000, 7000)
+            text = guard(pg, "tramite page")
+            if "CITA PREVIA" not in text.upper():
+                return ERROR, f"unexpected page: {text[:200]!r}"
 
             # 3) instructions page -> Entrar
-            pg.wait_for_selector("#btnEntrar", timeout=30000)
-            sleep_ms(1000, 2000)
+            wait_for(pg, "#btnEntrar", "instructions page")
+            sleep_ms(1500, 3000)
             pg.click("#btnEntrar")
             pg.wait_for_load_state("domcontentloaded")
-            sleep_ms(2000, 4000)
+            sleep_ms(3000, 5000)
 
             # 4) identity form (fields refuse paste -> type it)
-            pg.wait_for_selector("#txtIdCitado", timeout=30000)
+            wait_for(pg, "#txtIdCitado", "identity form")
             pg.click("#txtIdCitado")
-            pg.type("#txtIdCitado", NIE, delay=random.randint(60, 140))
-            sleep_ms(700, 1500)
+            pg.type("#txtIdCitado", NIE, delay=random.randint(80, 180))
+            sleep_ms(900, 1800)
             pg.click("#txtDesCitado")
-            pg.type("#txtDesCitado", FULL_NAME, delay=random.randint(60, 140))
-            sleep_ms(2000, 4000)
+            pg.type("#txtDesCitado", FULL_NAME, delay=random.randint(80, 180))
+            sleep_ms(2500, 4500)
             pg.click("#btnEnviar")
             pg.wait_for_load_state("domcontentloaded")
-            sleep_ms(2000, 4000)
+            sleep_ms(3000, 5000)
 
             # 5) identity confirmed -> ask for availability (read-only)
-            pg.wait_for_selector("#btnConsultar", timeout=30000)
-            sleep_ms(1000, 2000)
+            wait_for(pg, "#btnConsultar", "identity confirmation")
+            sleep_ms(1500, 3000)
 
             diag = pg.evaluate("""() => ({
                 enviar: typeof enviar,
@@ -204,30 +244,28 @@ def check_once(save_html=None):
             # The result page can be slow over the VPN, so poll for a verdict
             # instead of sleeping a fixed amount and hoping.
             deadline = time.time() + 60
-            body = ""
+            text = ""
             while time.time() < deadline:
-                try:
-                    body = pg.inner_text("body")
-                except Exception:
-                    time.sleep(1)
-                    continue
-                if ("En este momento no hay citas disponibles" in body
-                        or "Seleccione la oficina donde solicitar la cita" in body
-                        or "Seleccione una de las siguientes citas disponibles" in body
-                        or "DISPONE DE 5 MINUTOS" in body):
+                text = guard(pg, "result page")
+                if ("En este momento no hay citas disponibles" in text
+                        or "Seleccione la oficina donde solicitar la cita" in text
+                        or "Seleccione una de las siguientes citas disponibles" in text
+                        or "DISPONE DE 5 MINUTOS" in text):
                     break
                 time.sleep(2)
 
             if save_html:
                 open(save_html, "w").write(pg.content())
 
-            if "En este momento no hay citas disponibles" in body:
+            if "En este momento no hay citas disponibles" in text:
                 return NO_SLOTS, "no slots"
-            if ("Seleccione la oficina donde solicitar la cita" in body
-                    or "Seleccione una de las siguientes citas disponibles" in body
-                    or "DISPONE DE 5 MINUTOS" in body):
-                return AVAILABLE, body[:600]
-            return ERROR, f"unrecognised result page: {body[:300]!r}"
+            if ("Seleccione la oficina donde solicitar la cita" in text
+                    or "Seleccione una de las siguientes citas disponibles" in text
+                    or "DISPONE DE 5 MINUTOS" in text):
+                return AVAILABLE, text[:600]
+            return ERROR, f"unrecognised result page: {text[:300]!r}"
+        except Blocked as e:
+            return BLOCKED, str(e)
         except Exception as e:
             return ERROR, f"{type(e).__name__}: {str(e)[:250]}"
         finally:
@@ -240,7 +278,7 @@ def check_once(save_html=None):
 def notify_available(detail):
     url = f"{BASE}/{CATEGORY}/citar?p={PROVINCE}"
     send_telegram(
-        "🚨 <b>ЄСТЬ СЛОТИ НА CITA PREVIA!</b>\n\n"
+        "🚨 <b>Є СЛОТИ НА CITA PREVIA!</b>\n\n"
         f"📍 <b>{PROVINCE_NAME}</b>\n"
         f"📋 {TRAMITE_NAME}\n"
         f"👤 {FULL_NAME} — {NIE}\n\n"
@@ -263,6 +301,7 @@ def main():
     last_status = None
     last_notified = 0.0
     consecutive_errors = 0
+    block_streak = 0
 
     while True:
         status, detail = check_once()
@@ -273,10 +312,13 @@ def main():
             if last_status != AVAILABLE or (now - last_notified) > REMIND_AFTER:
                 notify_available(detail)
                 last_notified = now
-            consecutive_errors = 0
+            consecutive_errors = block_streak = 0
         elif status == NO_SLOTS:
             log("no slots")
-            consecutive_errors = 0
+            consecutive_errors = block_streak = 0
+        elif status == BLOCKED:
+            block_streak += 1
+            log(f"BLOCKED by WAF ({block_streak}): {detail}")
         else:
             consecutive_errors += 1
             log(f"ERROR ({consecutive_errors}): {detail}")
@@ -290,12 +332,19 @@ def main():
         last_status = status
 
         if not LOOP_MINUTES:
-            return 0 if status != ERROR else 1
+            return 0 if status in (AVAILABLE, NO_SLOTS) else 1
         if time.time() >= deadline:
             log("loop window finished")
             return 0
 
-        time.sleep(INTERVAL + random.uniform(-20, 40))
+        if block_streak:
+            # Exponential retreat: 10, 20, 40, capped at 60 minutes. Hammering a
+            # WAF that just said no is how you earn a longer ban.
+            wait = min(600 * 2 ** (block_streak - 1), 3600)
+            log(f"backing off {wait // 60} min after block")
+        else:
+            wait = INTERVAL + random.uniform(-20, 40)
+        time.sleep(wait)
 
 
 if __name__ == "__main__":
