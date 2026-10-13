@@ -1,0 +1,5 @@
+# root .gitignore hides *.png, the logo masks are needed
+!assets/*.png
+__pycache__/
+output/ball_escape_preview.mp4
+output/still_*.png
