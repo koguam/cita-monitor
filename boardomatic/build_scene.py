@@ -25,6 +25,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TEX = os.path.join(ROOT, "textures")
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 OUT = argv[0] if argv else os.path.join(ROOT, "genora_boardomatic.blend")
+# "grey": motion-reference build for Seedance. No logos, no brand colors, no red LEDs or
+# pink smoke, so the video model takes only motion and camera from it and the look from the assets.
+GREY = "grey" in argv[1:]
 
 FPS = 24
 FRAMES = 360
@@ -844,6 +847,24 @@ one.collection.children.link(SET)
 setup_render(one)
 one.world = scene.world
 one.camera = cam_ot
+
+if GREY:
+    CLAY = [  # material name prefix -> (grey level, alpha)
+        ("Ground", 0.30, 1), ("Road", 0.20, 1), ("WhiteLine", 0.50, 1), ("RedLED", 0.50, 1),
+        ("Truss", 0.45, 1), ("Mast", 0.40, 1), ("FloodLamp", 0.85, 1),
+        ("GenoraBody", 0.16, 1), ("GenoraTop", 0.16, 1), ("Chrome", 0.45, 1),
+        ("Jet", 0.85, 0.55), ("Vapor", 0.78, 0.5), ("ImpactSmoke", 0.78, 0.5),
+        ("Slab_", 0.62, 1), ("Face_", 0.62, 1),
+    ]
+    for m in bpy.data.materials:
+        for prefix, g, a in CLAY:
+            if m.name.startswith(prefix):
+                m.diffuse_color = (g, g, g, a)
+                break
+    for sc in (scene, one):
+        sc.display.shading.color_type = 'MATERIAL'
+        sc.render.use_stamp = False
+    scene.world.color = (0.12, 0.12, 0.12)
 
 readme = bpy.data.texts.new("README_RU")
 readme.write(
