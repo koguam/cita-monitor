@@ -1,0 +1,2 @@
+# the repo root ignores *.png (monitor screenshots); the boardomatic needs its icons
+!*.png
