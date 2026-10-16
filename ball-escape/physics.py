@@ -113,7 +113,7 @@ class Plan:
     segs: list = field(default_factory=list)
     breaks: list = field(default_factory=list)     # (t, ring index, angle)
     hits: list = field(default_factory=list)       # (t, ring index, angle, speed)
-    roll: dict | None = None                       # rolling phase samples
+    rolls: list = field(default_factory=list)      # rolling phases (sampled)
     t_free: float | None = None                    # ball left the last ring
     event_costs: list = field(default_factory=list)
 
@@ -122,11 +122,35 @@ class Plan:
 # helpers
 
 
-def _bounce_cost(pos, vel, v, n_out, e_rng, k_min=0.8):
-    """How far outgoing velocity v is from a physical reflection of vel.
+# Hard limits for a planned bounce, so fitting a bounce to the beat never
+# looks like the ball got an invisible kick or got glued to the wall.
+E_CAP = 1.3         # normal speed out <= 1.3 x normal speed in
+SPEED_KEEP = 0.45   # a hit faster than 350 px/s keeps at least 45% of its speed
+FRICTION = 0.6      # Coulomb friction coefficient between ball and ring
+SLIP_TOL = 250.0    # px/s of extra sliding change allowed (ball spin etc.)
+SPEED_GAIN = 1.15   # total speed out <= 1.15 x speed in (+ what the moving wall gives)
 
-    pos/vel: (S,2), v: (S,A,2), n_out: (S,2) outward normal at contact.
+
+def _bounce_cost(pos, vel, v, n_out, e_rng, wall_t=None, lim=None):
+    """How far outgoing velocity v is from a physical bounce of vel.
+
+    pos/vel: (S,2), v: (S,A,2), n_out: (S,2) outward normal at contact,
+    wall_t: (S,) speed of the (spinning) ring surface along the wall.
+
+    Normal part: v_out_n = -e * v_in_n with e in the round's range.
+    Sliding part: friction only pulls the ball's sliding speed towards the
+    speed of the moving wall, by at most FRICTION * (1 + e) * v_in_n, and at
+    most down to rolling. That is also the only way a bounce may speed the
+    ball up: a spinning ring dragging it along.
     """
+    S = len(pos)
+    wall_t = np.zeros(S) if wall_t is None else wall_t
+    lim = lim or {}
+    e_cap = lim.get("E_CAP", E_CAP)
+    friction = lim.get("FRICTION", FRICTION)
+    slip_tol = lim.get("SLIP_TOL", SLIP_TOL)
+    speed_gain = lim.get("SPEED_GAIN", SPEED_GAIN)
+    speed_keep = lim.get("SPEED_KEEP", SPEED_KEEP)
     t_hat = np.stack([-n_out[:, 1], n_out[:, 0]], -1)
     vin_n = (vel * n_out).sum(-1)
     vin_t = (vel * t_hat).sum(-1)
@@ -135,14 +159,31 @@ def _bounce_cost(pos, vel, v, n_out, e_rng, k_min=0.8):
     lo_n = (-e_rng[1] * vin_n)[:, None]
     hi_n = (-e_rng[0] * vin_n)[:, None]
     dn = np.maximum(lo_n - vo_n, 0) + np.maximum(vo_n - hi_n, 0)
-    a = (k_min * vin_t)[:, None]
-    bb = vin_t[:, None]
-    lo_t = np.minimum(a, bb)
-    hi_t = np.maximum(a, bb)
+    # sliding relative to the wall, before and after
+    s_in = vin_t - wall_t
+    jmax = friction * (1 + e_rng[1]) * np.abs(vin_n)
+    # friction can remove up to jmax of the slip; a ball ends up rolling at
+    # about 5/7 of its slip at the most (no spin), keep some slack for spin
+    keep = np.maximum(1.0 - jmax / np.maximum(np.abs(s_in), 1e-9), 0.5)
+    s_a, s_b = s_in * keep, s_in
+    lo_t = (np.minimum(s_a, s_b) + wall_t)[:, None]
+    hi_t = (np.maximum(s_a, s_b) + wall_t)[:, None]
     dt_ = np.maximum(lo_t - vo_t, 0) + np.maximum(vo_t - hi_t, 0)
     scale2 = (vin_n ** 2 + vin_t ** 2 + 250.0 ** 2)[:, None]
     cost = (dn ** 2 + dt_ ** 2) / scale2
     bad = vo_n > -15.0          # must actually leave the wall
+    # a bounce may not throw the ball out much harder than it came in
+    # (a light touch still gets a small allowance)
+    bad |= -vo_n > np.maximum(e_cap * vin_n, 220.0)[:, None]
+    # friction with the wall: anything beyond spin slack is a fake kick
+    bad |= dt_ > slip_tol
+    # no dead stops: a real hit keeps a fair part of its speed
+    speed_in = np.sqrt(vin_n ** 2 + vin_t ** 2)[:, None]
+    speed_out = np.sqrt(vo_n ** 2 + vo_t ** 2)
+    bad |= (speed_in > 350.0) & (speed_out < speed_keep * speed_in)
+    # no invisible kicks: only the spinning wall may add speed, through friction
+    wall_gain = np.maximum(np.abs(hi_t), np.abs(lo_t)) - np.abs(vin_t)[:, None]
+    bad |= speed_out > np.maximum(speed_gain * speed_in + np.maximum(wall_gain, 0), 220.0)
     cost = np.where(bad, np.inf, cost)
     return cost
 
@@ -169,21 +210,84 @@ def _first_contact(p, v, gvec, C, R, t_max, steps=400):
     return np.where(any_hit, hi, np.inf)
 
 
-def roll_sim(geo, ring, t0, phi0, dphi0, t1, dt=1 / 600, damping=1.1):
-    """Ball rolling on the inside of ring `ring` (no slipping, rolling drag)."""
-    R = geo.reff(ring)
-    k = (5.0 / 7.0) * geo.g / R
-    n = int(math.ceil((t1 - t0) / dt)) + 1
-    ts = t0 + np.arange(n) * dt
-    phi = np.empty(n)
-    om = np.empty(n)
-    phi[0], om[0] = phi0, dphi0
-    for j in range(1, n):
-        # semi-implicit Euler is plenty at 600 Hz
-        a = k * math.cos(phi[j - 1]) - damping * om[j - 1]
-        om[j] = om[j - 1] + a * dt
-        phi[j] = phi[j - 1] + om[j] * dt
-    return ts, phi, om
+ROLL_DT = 1 / 600
+
+
+def free_run(geo, rot, ring, t0, t1, p=None, v=None, roll=None, e=0.6, kt=0.95,
+             roll_speed=70.0, damping=1.1):
+    """Plain physics from t0 to t1, nothing planned: the ball rolls on a ring,
+    drops into a hole when the hole reaches it (the ring breaks), flies,
+    bounces with restitution e, slips through further holes, settles again.
+
+    Start rolling with roll=(phi, dphi) or flying with p, v.
+    Returns (segs, rolls, breaks, hits, ring).
+    """
+    C = geo.C
+    gvec = np.array([0.0, geo.g])
+    segs, rolls, breaks, hits = [], [], [], []
+    t = t0
+    contact = True
+    if roll is not None:
+        mode = "roll"
+        phi, om = roll
+    else:
+        mode = "fly"
+    while t < t1 and ring < geo.n:
+        if mode == "roll":
+            R = geo.reff(ring)
+            k = (5.0 / 7.0) * geo.g / R
+            ts, ph, oms = [t], [phi], [om]
+            fell = False
+            while t < t1:
+                a = k * math.cos(phi) - damping * om
+                om += a * ROLL_DT
+                phi += om * ROLL_DT
+                t += ROLL_DT
+                ts.append(t)
+                ph.append(phi)
+                oms.append(om)
+                if abs(wrap(phi - rot.angle(ring, t))) < geo.gap / 2:
+                    fell = True          # the hole reached the ball
+                    break
+            rolls.append(dict(t=np.array(ts), phi=np.array(ph), om=np.array(oms), R=R, ring=ring))
+            if not fell:
+                break
+            breaks.append((t, ring, phi, abs(om) * R))
+            n = np.array([math.cos(phi), math.sin(phi)])
+            p = C + R * n
+            v = R * om * np.array([-n[1], n[0]])
+            ring += 1
+            mode = "fly"
+            contact = False
+            continue
+        R = geo.reff(ring)
+        tau = _first_contact(p[None], v[None], gvec, C, R, max(0.05, t1 - t + 0.05), steps=800)[0]
+        if not np.isfinite(tau) or t + tau > t1:
+            segs.append(Seg(t, t1 + 1.0, p.copy(), v.copy(), contact=contact))
+            break
+        segs.append(Seg(t, t + tau, p.copy(), v.copy(), contact=contact))
+        t += tau
+        p = p + v * tau + 0.5 * gvec * tau * tau
+        v = v + gvec * tau
+        ang = math.atan2(p[1] - C[1], p[0] - C[0])
+        if abs(wrap(ang - rot.angle(ring, t))) < geo.gap / 2:
+            breaks.append((t, ring, ang, float(np.linalg.norm(v))))
+            ring += 1
+            contact = False
+            continue
+        n = (p - C) / R
+        t_hat = np.array([-n[1], n[0]])
+        vn, vt = v @ n, v @ t_hat
+        hits.append((t, ring, ang, float(np.linalg.norm(v)), False))
+        if e * vn < roll_speed:
+            mode = "roll"
+            phi, om = ang, (5.0 / 7.0) * vt / R
+            continue
+        v = -e * vn * n + kt * vt * t_hat
+        contact = True
+    if ring >= geo.n and mode == "fly":
+        segs.append(Seg(t, 99.0, p.copy(), v.copy(), contact=False))
+    return segs, rolls, breaks, hits, ring
 
 
 # --------------------------------------------------------------------------
@@ -202,7 +306,7 @@ def _concat(batches):
 
 
 def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
-               diversity=True, want_path=False, chain_tol=0.03, burst_win=0.075,
+               diversity=True, want_path=False, chain_tol=0.017, burst_win=0.075,
                bounce_win=0.10):
     """Beam search over landing points, one event (sound) at a time.
 
@@ -222,6 +326,7 @@ def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
     E = len(events)
     t_up = cfg["t_up"]
     margin = 0.03
+    chain_tol = cfg.get("chain_tol", chain_tol)
     win = cfg["outcome"] == "win"
 
     t0 = cfg["t_start"] if cfg["t_start"] >= cfg["t_show"] else cfg["t_show"]
@@ -231,7 +336,7 @@ def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
                            ring=np.array([0]), rland=np.array([0]), esc=np.array([False]),
                            k=np.array([-1]), t_from=np.array([t0]), p_from=np.array([C]),
                            v=np.zeros((1, 2)), T=np.array([t0]), q=np.array([C]),
-                           v_land=np.zeros((1, 2)), brk=[[]]))
+                           v_land=np.zeros((1, 2)), brk=[[]], free=[None]))
     nodes = []
 
     def keep_best(batch, n_keep):
@@ -265,7 +370,9 @@ def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
             if rr >= geo.n:
                 continue
             if events[-1][1] == "settle":
-                out[sel] = _settle_cost(geo, rot, rr, pc[sel], vc[sel], tc[sel].max(), t_up, C)
+                out[sel] = _settle_cost(geo, rot, rr, pc[sel], vc[sel], tc[sel].max(), t_up, C,
+                                        drop_at=cfg.get("drop_at"),
+                                        drop_tol=cfg.get("drop_tol", 0.012))
             else:
                 out[sel] = _coast_cost(geo, rot, rr, pc[sel], vc[sel], tc[sel], t_up, C, gvec, e_rng)
         return out
@@ -301,14 +408,14 @@ def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
             span = TAU - geo.gap - 2 * margin
             phis_b = th + geo.gap / 2 + margin + span * (np.arange(n_ang) + 0.5) / n_ang
             phis_e = th + np.linspace(-geo.esc_half(rr), geo.esc_half(rr), n_esc)
-            if kind in ("bounce", "settle"):
+            if kind in ("bounce", "settle", "settle_drop"):
                 phis = phis_b
-            elif kind == "escape":
+            elif kind in ("escape", "escape_free"):
                 phis = phis_e
             else:   # "any": the planner decides, bounce or escape
                 phis = np.concatenate([phis_b, phis_e])
             esc_a = np.zeros(len(phis), bool)
-            if kind == "escape":
+            if kind in ("escape", "escape_free"):
                 esc_a[:] = True
             elif kind == "any":
                 esc_a[len(phis_b):] = True
@@ -332,7 +439,9 @@ def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
             n_out = pos - C
             nn = np.linalg.norm(n_out, axis=-1, keepdims=True)
             n_out = n_out / np.where(nn > 1e-9, nn, 1.0)
-            c_b = _bounce_cost(pos, vel, v, n_out, e_rng)
+            # surface speed of the ring the ball is leaving from
+            wall_t = rot.speed(rr) * geo.r_in(rr) * np.ones(S)
+            c_b = _bounce_cost(pos, vel, v, n_out, e_rng, wall_t, cfg.get("limits"))
             c_init = 0.35 * (speed / 650.0) ** 2
             c = np.where(init[:, None], c_init, c_b) + 0.02 * (speed / 1400.0) ** 2
             total = cost[:, None] + np.where(ok, c, np.inf)
@@ -361,10 +470,18 @@ def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
                     b = {key: val[sel] for key, val in base.items()}
                     b.update(pos=pc[sel], vel=vc[sel], t=tc[sel], cost=cj, ring=ring[sel],
                              init=np.zeros(len(sel), bool), brk=[brk[i] for i in sel],
-                             k=kk[sel])
+                             k=kk[sel], free=[None] * len(sel))
                     buckets[int(j)].append(b)
 
             pc, vc, tc = q[ai], v_end[si, ai], np.full(M, T)
+            if kind == "escape_free":
+                _free_window(cfg, geo, rot, rr, k, T, events, E, t_up, e_rng, gvec, C,
+                             flat, base, pc, vc, phis[ai], buckets, terminal)
+                continue
+            if kind == "settle_drop":
+                _settle_drop(cfg, geo, rot, rr, k, T, events, E, t_up, e_rng, gvec, C,
+                             flat, base, pc, vc, buckets, terminal)
+                continue
             isb = ~esc_a[ai]
             if kind == "any":
                 # chords that only bounce feel like no progress: nudge towards escapes
@@ -440,10 +557,162 @@ def plan_round(cfg, center, rot, beam=60, n_ang=72, n_esc=7, K=36,
     return _backtrack(cfg, geo, rot, nodes, best, out, gvec, C, e_rng)
 
 
-def _settle_cost(geo, rot, ring, pos, vel, T, t_up, C, damping=1.1):
-    """Landing that turns into rolling: the hole must never pass under it."""
+def _free_window(cfg, geo, rot, rr, k, T, events, E, t_up, e_rng, gvec, C,
+                 flat, base, pc, vc, ang, buckets, terminal):
+    """Event kind "escape_free": the ball enters ring rr's hole exactly on the
+    sound, then nothing is planned until shortly before the next sound: it
+    flies, slips through holes and bounces by plain physics (the soundtrack is
+    one continuous sweep there). The last contact of that free run is where
+    planning takes over again for the next event."""
+    j = k + 1
+    t_end = events[j][0] - 0.03 if j < E else t_up
+    t_end = min(t_end, cfg.get("free_until", t_end))
+    e_free = 0.5 * (e_rng[0] + e_rng[1])
+    want = cfg.get("free_rings_min", 0)
+    out = []
+    if j == E and cfg["outcome"] == "win":
+        # the winning run: from this hole plain physics must carry the ball
+        # out of every remaining ring before the clock runs out
+        rows = []
+        for i in np.argsort(flat)[:cfg.get("free_keep", 40)]:
+            fs, frl, fb, fh, ring_end = free_run(geo, rot, rr + 1, T, t_up - 0.05,
+                                                 p=pc[i].copy(), v=vc[i].copy(), e=e_free)
+            if frl or ring_end < geo.n:
+                continue
+            brk = [(T, int(rr), float(ang[i]))] + [b[:3] for b in fb]
+            # the sooner it is out the better: it reads as a breakout
+            rows.append((i, flat[i] + 0.5 * (brk[-1][0] - T), brk, (fs, fh)))
+        if not rows:
+            return
+        idx = np.array([r[0] for r in rows])
+        b = {key: val[idx] for key, val in base.items()}
+        b.update(pos=pc[idx], vel=vc[idx], t=np.array([r[2][-1][0] for r in rows]),
+                 cost=np.array([r[1] for r in rows]), ring=np.full(len(rows), geo.n),
+                 init=np.zeros(len(rows), bool), brk=[r[2] for r in rows],
+                 k=np.full(len(rows), k), free=[r[3] for r in rows])
+        buckets[j].append(b)
+        return
+    for i in np.argsort(flat)[:cfg.get("free_keep", 40)]:
+        fs, frl, fb, fh, ring_end = free_run(geo, rot, rr + 1, T, t_end,
+                                             p=pc[i].copy(), v=vc[i].copy(), e=e_free)
+        if frl or not fh or ring_end >= geo.n:
+            continue        # it settled, never touched a ring, or got out
+        th, ring_c = fh[-1][0], fh[-1][1]
+        keep = [sg for sg in fs if sg.t0 < th]
+        last = keep[-1]
+        tau = th - last.t0
+        p_c = last.p0 + last.v0 * tau + 0.5 * gvec * tau * tau
+        v_c = last.v0 + gvec * tau
+        keep[-1] = Seg(last.t0, th, last.p0, last.v0, contact=last.contact)
+        brk = [(T, int(rr), float(ang[i]))] + [(b[0], b[1], b[2]) for b in fb if b[0] <= th]
+        extra = 0.3 * max(0, want - len(brk))
+        # keep breaking rings for as long as the sweep lasts
+        spread = cfg.get("free_spread_until")
+        if spread:
+            extra += 2.0 * max(0.0, spread - brk[-1][0])
+        out.append((i, p_c, v_c, th, ring_c, flat[i] + extra, brk, (keep, fh)))
+    if not out:
+        return
+    idx = np.array([o[0] for o in out])
+    b = {key: val[idx] for key, val in base.items()}
+    cost = np.array([o[5] for o in out])
+    pos = np.array([o[1] for o in out])
+    vel = np.array([o[2] for o in out])
+    tt = np.array([o[3] for o in out])
+    ring = np.array([o[4] for o in out])
+    if j == E:
+        cost = cost + terminal(pos, vel, tt, ring)
+    fin = np.isfinite(cost)
+    if not fin.any():
+        return
+    sel = np.nonzero(fin)[0]
+    b = {key: val[sel] for key, val in b.items()}
+    b.update(pos=pos[sel], vel=vel[sel], t=tt[sel], cost=cost[sel], ring=ring[sel],
+             init=np.zeros(len(sel), bool), brk=[out[i][6] for i in sel],
+             k=np.full(len(sel), k), free=[out[i][7] for i in sel])
+    buckets[j].append(b)
+
+
+def _settle_drop(cfg, geo, rot, rr, k, T, events, E, t_up, e_rng, gvec, C,
+                 flat, base, pc, vc, buckets, terminal):
+    """Event kind "settle_drop": the ball lands softly on the sound and rolls
+    (rolling is silent); the next sound is the moment the spiral's hole
+    reaches it and it drops through. After that, plain physics until shortly
+    before the sound after that, where planning takes over again."""
+    if k + 1 >= E or events[k + 1][1] not in ("escape", "any"):
+        return
+    t_drop = events[k + 1][0]
+    drop_tol = cfg.get("drop_tol", 0.012)
+    # quick vectorised filter: when does the hole reach the rolling ball?
+    pre = _settle_cost(geo, rot, rr, pc, vc, T, t_up, C, drop_at=t_drop, drop_tol=drop_tol)
+    tot = flat + pre
+    cand = [i for i in np.argsort(tot)[:cfg.get("free_keep", 40)] if np.isfinite(tot[i])]
+    if not cand:
+        return
+    j = k + 2
+    t_end = events[j][0] - 0.03 if j < E else t_up
+    e_free = 0.5 * (e_rng[0] + e_rng[1])
+    R = geo.reff(rr)
+    out = []
+    for i in cand:
+        n = (pc[i] - C) / R
+        vt = (vc[i] @ np.array([-n[1], n[0]])) * 5.0 / 7.0
+        phi0 = math.atan2(n[1], n[0])
+        fs, frl, fb, fh, ring_end = free_run(geo, rot, rr, T, t_end, roll=(phi0, vt / R), e=e_free)
+        if not fb or abs(fb[0][0] - t_drop) > drop_tol:
+            continue
+        if ring_end >= geo.n:
+            if j == E and cfg["outcome"] == "win":
+                out.append((i, None, None, fb[-1][0], geo.n, tot[i], fb, (fs, frl, fh), fb[-1][0]))
+            continue
+        # planning takes over at the first contact after the drop, while the
+        # chord still rings; a later one would be a bounce without a sound
+        after = [h for h in fh if h[0] > fb[0][0]]
+        if frl[1:] or not after or after[0][0] > t_drop + cfg.get("drop_ring_out", 0.25):
+            continue
+        th, ring_c = after[0][0], after[0][1]
+        fh = [h for h in fh if h[0] <= th]
+        keep = [sg for sg in fs if sg.t0 < th]
+        last = keep[-1]
+        tau = th - last.t0
+        p_c = last.p0 + last.v0 * tau + 0.5 * gvec * tau * tau
+        v_c = last.v0 + gvec * tau
+        keep[-1] = Seg(last.t0, th, last.p0, last.v0, contact=last.contact)
+        brk = [b[:3] for b in fb if b[0] <= th]
+        out.append((i, p_c, v_c, th, ring_c, tot[i], brk, (keep, frl, fh), None))
+    if not out:
+        return
+    rows = []
+    for (i, p_c, v_c, th, ring_c, cost, brk, free, t_free) in out:
+        if p_c is None:
+            p_c, v_c = pc[i], vc[i]
+        rows.append((i, p_c, v_c, th, ring_c, cost, [b[:3] for b in brk], free))
+    idx = np.array([r[0] for r in rows])
+    b = {key: val[idx] for key, val in base.items()}
+    pos = np.array([r[1] for r in rows])
+    vel = np.array([r[2] for r in rows])
+    tt = np.array([r[3] for r in rows])
+    ring = np.array([r[4] for r in rows])
+    cost = np.array([r[5] for r in rows])
+    if j == E:
+        cost = cost + terminal(pos, vel, tt, ring)
+    sel = np.nonzero(np.isfinite(cost))[0]
+    if not len(sel):
+        return
+    b = {key: val[sel] for key, val in b.items()}
+    b.update(pos=pos[sel], vel=vel[sel], t=tt[sel], cost=cost[sel], ring=ring[sel],
+             init=np.zeros(len(sel), bool), brk=[rows[i][6] for i in sel],
+             k=np.full(len(sel), k + 1), free=[rows[i][7] for i in sel],
+             esc=np.ones(len(sel), bool))
+    buckets[j].append(b)
+
+
+def _settle_cost(geo, rot, ring, pos, vel, T, t_up, C, damping=1.1, drop_at=None,
+                 drop_tol=0.012):
+    """Landing that turns into rolling. Without drop_at the hole must never
+    reach the ball before the time is up; with drop_at it must reach it right
+    at that moment (the ball then falls into the next rings)."""
     R = geo.reff(ring)
-    half = geo.gap / 2 + math.asin(geo.b / geo.r_in(ring)) + 0.08
     n = (pos - C) / R
     t_hat = np.stack([-n[:, 1], n[:, 0]], -1)
     vin_n = (vel * n).sum(-1)
@@ -451,15 +720,20 @@ def _settle_cost(geo, rot, ring, pos, vel, T, t_up, C, damping=1.1):
     phi = np.arctan2(n[:, 1], n[:, 0])
     om = vt / R
     k = (5.0 / 7.0) * geo.g / R
-    dt = 1 / 200
-    bad = np.zeros(len(pos), bool)
+    t_touch = np.full(len(pos), np.inf)
     t = T
-    while t < t_up:
+    t_end = t_up if drop_at is None else drop_at + drop_tol + ROLL_DT
+    while t < t_end:
         a = k * np.cos(phi) - damping * om
-        om = om + a * dt
-        phi = phi + om * dt
-        t += dt
-        bad |= np.abs(wrap(phi - rot.angle(ring, t))) < half
+        om = om + a * ROLL_DT
+        phi = phi + om * ROLL_DT
+        t += ROLL_DT
+        hit = (np.abs(wrap(phi - rot.angle(ring, t))) < geo.gap / 2) & ~np.isfinite(t_touch)
+        t_touch = np.where(hit, t, t_touch)
+    if drop_at is None:
+        bad = np.isfinite(t_touch)
+    else:
+        bad = ~(np.abs(t_touch - drop_at) <= drop_tol)
     # a soft landing: penalise slamming in fast, and wild swinging
     out = 0.15 * (np.maximum(vin_n - 450.0, 0) / 400.0) ** 2 + 0.05 * (np.abs(vt) / 400.0) ** 2
     return np.where(bad, np.inf, out)
@@ -501,6 +775,20 @@ def _backtrack(cfg, geo, rot, nodes, best, out, gvec, C, e_rng):
         segs.append(Seg(float(c["t_from"]), T, c["p_from"].copy(), c["v"].copy(),
                         contact=len(segs) > 0))
         ang = math.atan2(c["q"][1] - C[1], c["q"][0] - C[0])
+        if c.get("free") is not None:
+            free = c["free"]
+            fs, frl, fh = (free[0], [], free[1]) if len(free) == 2 else free
+            if len(free) == 3:
+                # it landed on the sound and rolled until the hole came
+                hits.append((T, int(c["rland"]), ang, float(np.linalg.norm(c["v_land"])), True))
+            for (tb, rb, ab) in c["brk"]:
+                breaks.append((tb, rb, ab, float(np.linalg.norm(c["v_land"]))))
+            segs.extend(fs)
+            out.rolls.extend(frl)
+            hits.extend(fh)          # natural contacts, the last one hands over
+            if int(c["ring"]) >= geo.n:
+                out.t_free = float(c["brk"][-1][0])
+            continue
         if c["esc"]:
             for (tb, rb, ab) in c["brk"]:
                 breaks.append((tb, rb, ab, float(np.linalg.norm(c["v_land"]))))
@@ -526,8 +814,23 @@ def _backtrack(cfg, geo, rot, nodes, best, out, gvec, C, e_rng):
             t_hat = np.array([-n[1], n[0]])
             vt = (vin @ t_hat) * 5.0 / 7.0
             phi0 = math.atan2(n[1], n[0])
-            ts, phi, om = roll_sim(geo, ring_final, T, phi0, vt / R, t_up + 0.05)
-            out.roll = dict(t=ts, phi=phi, om=om, R=R)
+            e_free = 0.5 * (e_rng[0] + e_rng[1])
+            fs, fr, fb, fh, _ring = free_run(geo, rot, ring_final, T, t_up + 0.05,
+                                             roll=(phi0, vt / R), e=e_free)
+            segs.extend(fs)
+            out.rolls.extend(fr)
+            breaks.extend((tb, rb, ab, sp) for (tb, rb, ab, sp) in fb if tb <= t_up)
+            hits.extend(h for h in fh if h[0] <= t_up)
+            lo, hi = cfg.get("drop_rings", (0, geo.n))
+            late = [b[0] for b in fb if b[0] <= t_up]
+            nb = len(late)
+            # how many rings the late fall gets through before time is up, and
+            # it should keep breaking them while the crackle lasts
+            out.cost += 2.0 * (max(0, lo - nb) + max(0, nb - hi))
+            if late:
+                # still breaking rings when the clock hits zero: it ran out of
+                # time mid-way, it did not get stopped by a wall
+                out.cost += 6.0 * max(0.0, (t_up - 0.05) - late[-1])
         else:
             # pick the most natural reflection that coasts to the freeze
             n = (p - C) / np.linalg.norm(p - C)
@@ -560,23 +863,30 @@ def _backtrack(cfg, geo, rot, nodes, best, out, gvec, C, e_rng):
 # trajectory evaluation + verification
 
 
+def active_piece(plan: Plan, t: float):
+    """The flight (Seg) or rolling phase (dict) the ball is in at time t."""
+    piece, t0 = plan.segs[0], -math.inf
+    for sg in plan.segs:
+        if t0 <= sg.t0 <= t:
+            piece, t0 = sg, sg.t0
+    for r in plan.rolls:
+        if t0 < r["t"][0] <= t:
+            piece, t0 = r, r["t"][0]
+    return piece
+
+
 def ball_state(plan: Plan, geo: Geo, t: float):
     """Position and velocity of the ball at time t."""
-    if plan.roll is not None and t >= plan.roll["t"][0]:
-        r = plan.roll
-        j = min(int((t - r["t"][0]) / (r["t"][1] - r["t"][0])), len(r["t"]) - 1)
+    piece = active_piece(plan, t)
+    if isinstance(piece, dict):
+        r = piece
+        j = min(int((t - r["t"][0]) / ROLL_DT), len(r["t"]) - 1)
         phi, om = r["phi"][j], r["om"][j]
         n = np.array([math.cos(phi), math.sin(phi)])
         return geo.C + r["R"] * n, r["R"] * om * np.array([-n[1], n[0]])
     gvec = np.array([0.0, geo.g])
-    seg = plan.segs[0]
-    for s in plan.segs:
-        if t >= s.t0:
-            seg = s
-        else:
-            break
-    tau = max(t - seg.t0, 0.0)
-    return seg.p0 + seg.v0 * tau + 0.5 * gvec * tau * tau, seg.v0 + gvec * tau
+    tau = max(t - piece.t0, 0.0)
+    return piece.p0 + piece.v0 * tau + 0.5 * gvec * tau * tau, piece.v0 + gvec * tau
 
 
 def verify(plan: Plan, cfg, center, t0, t1, dt=0.0005):
@@ -636,6 +946,7 @@ def _sample_rot(cfg, rng):
 
 def _coarse(args):
     cfg, center, seed, n = args
+    cfg = dict(cfg, drop_tol=max(0.03, cfg.get("drop_tol", 0.012)))
     rng = np.random.default_rng(seed)
     out = []
     for _ in range(n):

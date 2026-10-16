@@ -6,8 +6,8 @@
     python3 render.py --replan        # redo the physics search
     python3 render.py --still 2.0     # single frame as PNG
 
-The physics plan is cached in plans.pkl, delete it (or --replan) after
-changing timings/geometry in scenario.py.
+The physics plan is cached in plans.pkl per round. Changing a round in
+scenario.py replans just that round; --replan searches every round again.
 """
 
 import argparse
@@ -22,7 +22,9 @@ import time
 
 import cairo
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
+
+HAVE_RAQM = features.check("raqm")      # OpenType features (tabular digits)
 
 import physics as ph
 import scenario as sc
@@ -97,7 +99,8 @@ class Fonts:
     def get(cls, path, size):
         key = (path, int(round(size)))
         if key not in cls.cache:
-            cls.cache[key] = ImageFont.truetype(path, key[1])
+            full = path if os.path.isabs(path) else os.path.join(HERE, path)
+            cls.cache[key] = ImageFont.truetype(full, key[1])
         return cls.cache[key]
 
 
@@ -157,12 +160,24 @@ class TextCache:
         key = ("tnum", text, path, size, color)
         if key not in cls.cache:
             f = Fonts.get(path, size)
-            adv = f.getlength(text, features=["tnum"])
             _x0, y0, _x1, y1 = f.getbbox("0123456789")
             pad = 8
-            w, h = int(adv) + 2 * pad, (y1 - y0) + 2 * pad
-            mask = Image.new("L", (w, h), 0)
-            ImageDraw.Draw(mask).text((pad, pad - y0), text, font=f, fill=255, features=["tnum"])
+            if HAVE_RAQM:
+                adv = f.getlength(text, features=["tnum"])
+                w, h = int(adv) + 2 * pad, (y1 - y0) + 2 * pad
+                mask = Image.new("L", (w, h), 0)
+                ImageDraw.Draw(mask).text((pad, pad - y0), text, font=f, fill=255, features=["tnum"])
+            else:
+                # no OpenType features available: centre each glyph in an
+                # equal cell so the numbers still do not wobble
+                cell = max(f.getlength(ch) for ch in "0123456789")
+                cells = [cell if ch.isdigit() else f.getlength(ch) for ch in text]
+                w, h = int(sum(cells)) + 2 * pad, (y1 - y0) + 2 * pad
+                mask = Image.new("L", (w, h), 0)
+                x = pad
+                for ch, cw in zip(text, cells):
+                    ImageDraw.Draw(mask).text((x + (cw - f.getlength(ch)) / 2, pad - y0), ch, font=f, fill=255)
+                    x += cw
             img = Image.new("RGBA", (w, h), color + (0,))
             img.putalpha(mask)
             cls.cache[key] = (pil_to_surface(img), w, h)
@@ -170,6 +185,41 @@ class TextCache:
         ctx.set_source_surface(surf, x - w / 2, y - h / 2)
         ctx.paint_with_alpha(alpha)
         return w
+
+    @classmethod
+    def ink(cls, text, path, size):
+        """Pixel-exact ink box (x0, x1) of a string drawn at the origin."""
+        key = ("ink", text, path, size)
+        if key not in cls.cache:
+            f = Fonts.get(path, size)
+            x0, _y0, x1, _y1 = f.getbbox(text)
+            asc, desc = f.getmetrics()
+            pad = 8
+            mask = Image.new("L", (x1 - x0 + 2 * pad, asc + desc + 2 * pad), 0)
+            ImageDraw.Draw(mask).text((pad - x0, pad), text, font=f, fill=255)
+            bb = mask.getbbox() or (0, 0, 1, 1)
+            cls.cache[key] = (bb[0] - pad + x0, bb[2] - pad + x0)
+        return cls.cache[key]
+
+    @classmethod
+    def draw_cap(cls, ctx, text, x, y, path, size, color=(255, 255, 255), alpha=1.0):
+        """Centre horizontally on the ink and vertically on the cap height."""
+        key = ("cap", text, path, size, color)
+        if key not in cls.cache:
+            f = Fonts.get(path, size)
+            ix0, ix1 = cls.ink(text, path, size)
+            _a, cy0, _b, cy1 = f.getbbox("HXD")
+            asc, desc = f.getmetrics()
+            pad = 8
+            w, h = int(ix1 - ix0) + 2 * pad, asc + desc + 2 * pad
+            mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(mask).text((pad - ix0, pad), text, font=f, fill=255)
+            img = Image.new("RGBA", (w, h), color + (0,))
+            img.putalpha(mask)
+            cls.cache[key] = (pil_to_surface(img), w, pad + (cy0 + cy1) / 2)
+        surf, w, yc = cls.cache[key]
+        ctx.set_source_surface(surf, x - w / 2, y - yc)
+        ctx.paint_with_alpha(alpha)
 
     @classmethod
     def width(cls, text, path, size):
@@ -250,9 +300,10 @@ def get_plans(replan=False, samples=3000, seeds=(1, 4)):
             cache[key] = best
             changed = True
         plans.append(cache[key])
-    if changed:
+    live = {plan_key(cfg) for cfg in sc.ROUNDS}
+    if changed or set(cache) != live:
         with open(path, "wb") as f:
-            pickle.dump(cache, f)
+            pickle.dump({k: v for k, v in cache.items() if k in live}, f)
     return plans
 
 
@@ -338,45 +389,37 @@ class RoundScene:
 
     # ---- ball spin (rolling at every bounce)
     def _build_spin(self):
-        geo, b = self.geo, self.geo.b
-        segs = self.plan.segs
-        self.spin_tab = []
-        ang, om = 0.0, 0.0
-        for j, s in enumerate(segs):
-            if j > 0:
-                prev = segs[j - 1]
-                dtp = s.t0 - prev.t0
-                ang += self.spin_tab[-1][2] * dtp
-            if s.contact and j > 0:
-                n = (s.p0 - geo.C) / max(1e-9, np.linalg.norm(s.p0 - geo.C))
-                t_hat = np.array([-n[1], n[0]])
-                om = -(s.v0 @ t_hat) / b
-            self.spin_tab.append((s.t0, ang, om))
-        r = self.plan.roll
-        if r is not None:
-            dt = r["t"][1] - r["t"][0]
-            t0 = r["t"][0]
-            # spin at roll start
-            base = self.spin_at_segments(t0)
-            self.roll_spin = base + np.cumsum(-r["R"] * r["om"] / b) * dt
-        else:
-            self.roll_spin = None
-
-    def spin_at_segments(self, t):
-        cur = self.spin_tab[0]
-        for row in self.spin_tab:
-            if t >= row[0]:
-                cur = row
+        """Ball spin: after every bounce it rolls along the wall, while rolling
+        it turns with the rolling speed; through holes it keeps spinning."""
+        geo, b, plan = self.geo, self.geo.b, self.plan
+        pieces = sorted([(sg.t0, 0, sg) for sg in plan.segs] +
+                        [(r["t"][0], 1, r) for r in plan.rolls], key=lambda x: x[0])
+        first = pieces[0][0]
+        om_prev = 0.0
+        self.seg_om = {}
+        for t0, kind, d in pieces:
+            if kind == 0:
+                if d.contact and t0 > first:
+                    n = (d.p0 - geo.C) / max(1e-9, np.linalg.norm(d.p0 - geo.C))
+                    om_prev = -(d.v0 @ np.array([-n[1], n[0]])) / b
+                self.seg_om[id(d)] = om_prev
             else:
-                break
-        return cur[1] + cur[2] * (t - cur[0])
+                om_prev = -d["R"] * d["om"][-1] / b
+        end = (self.cfg["t_up"] if self.cfg["outcome"] == "lose" else (self.t_free or self.cfg["t_up"]) + 3) + 0.1
+        dt = 1 / 600
+        self.spin_t = np.arange(first, end, dt)
+        oms = np.empty(len(self.spin_t))
+        for i, t in enumerate(self.spin_t):
+            piece = ph.active_piece(plan, t)
+            if isinstance(piece, dict):
+                j = min(int((t - piece["t"][0]) / ph.ROLL_DT), len(piece["t"]) - 1)
+                oms[i] = -piece["R"] * piece["om"][j] / b
+            else:
+                oms[i] = self.seg_om[id(piece)]
+        self.spin_a = np.concatenate([[0.0], np.cumsum(oms[:-1]) * dt])
 
     def spin(self, t):
-        r = self.plan.roll
-        if r is not None and t >= r["t"][0]:
-            j = min(int((t - r["t"][0]) / (r["t"][1] - r["t"][0])), len(r["t"]) - 1)
-            return self.roll_spin[j]
-        return self.spin_at_segments(t)
+        return float(np.interp(t, self.spin_t, self.spin_a))
 
     # ---- drawing
     def draw(self, ctx, t, ui=True):
@@ -443,10 +486,10 @@ class RoundScene:
             k = tau / life
             alpha = (1 - k) ** 1.3
             col = d["col"]
-            if lose_k > 0:
-                col = mix(col, self.lose_col, lose_k)
             if tau < 0.06:      # flash white for a moment so the break reads
                 col = mix(col, (1, 1, 1), 0.65 * (1 - tau / 0.06))
+            if lose_k > 0:
+                col = mix(col, self.lose_col, lose_k)
             rad = d["size"] * (1 - 0.35 * k) * d["jit"]
             ctx.new_path()
             for j in range(len(p)):
@@ -476,13 +519,13 @@ class RoundScene:
         cfg = self.cfg
         lost = cfg["outcome"] == "lose" and t >= cfg["t_up"]
         won = cfg["outcome"] == "win" and self.t_free is not None and t >= self.t_free
-        title_y = 405
         if lost:
             k = (t - cfg["t_up"]) / 0.22
-            sc_ = 1.0 + 0.35 * (1 - ease_out(k))
-            TextCache.draw(ctx, "YOU LOSE!", sc.W / 2, title_y, sc.FONT_SEMIBOLD, 66, scale=sc_)
+            pop = 1.0 + 0.3 * (1 - ease_out(k))
+            tiktok_label(ctx, "YOU LOSE!", sc.W / 2, TITLE_Y, 80, fg=(255, 255, 255), bg=TT_RED,
+                         scale=pop)
         else:
-            TextCache.draw(ctx, cfg["title"], sc.W / 2, title_y, sc.FONT_SEMIBOLD, 66)
+            tiktok_label(ctx, cfg["title"], sc.W / 2, TITLE_Y, 80)
         draw_timer(ctx, t, self.remaining(t), lost, won, cfg, self.t_free)
         if won:
             draw_escaped(ctx, t, self.t_free)
@@ -551,38 +594,6 @@ def draw_genora_ball(ctx, x, y, b, spin):
     ctx.restore()
 
 
-def draw_clock_icon(ctx, x, y, r, col, alpha=1.0):
-    ctx.save()
-    ctx.set_source_rgba(*col, alpha)
-    ctx.set_line_width(r * 0.22)
-    ctx.new_path()
-    ctx.arc(x, y + r * 0.08, r, 0, TAU)
-    ctx.stroke()
-    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-    ctx.move_to(x, y + r * 0.08)
-    ctx.line_to(x, y - r * 0.5)
-    ctx.move_to(x, y + r * 0.08)
-    ctx.line_to(x + r * 0.45, y + r * 0.3)
-    ctx.stroke()
-    # crown
-    ctx.rectangle(x - r * 0.28, y - r * 1.38, r * 0.56, r * 0.26)
-    ctx.fill()
-    ctx.restore()
-
-
-def draw_check_icon(ctx, x, y, r, col):
-    ctx.save()
-    ctx.set_source_rgb(*col)
-    ctx.set_line_width(r * 0.28)
-    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-    ctx.set_line_join(cairo.LINE_JOIN_ROUND)
-    ctx.move_to(x - r * 0.75, y + r * 0.05)
-    ctx.line_to(x - r * 0.2, y + r * 0.6)
-    ctx.line_to(x + r * 0.8, y - r * 0.55)
-    ctx.stroke()
-    ctx.restore()
-
-
 def rounded_rect(ctx, x, y, w, h, r):
     r = min(r, h / 2, w / 2)
     ctx.new_path()
@@ -593,87 +604,47 @@ def rounded_rect(ctx, x, y, w, h, r):
     ctx.close_path()
 
 
-RED = rgb("#FF3B3B")
-GREEN = rgb("#3BE07A")
+TT_RED = (254, 44, 85)        # TikTok red
+TT_GREEN = (59, 224, 122)
+TITLE_Y = 300
+TIMER_Y = 468
+
+
+def tiktok_label(ctx, text, x, y, size, fg=(0, 0, 0), bg=(255, 255, 255), scale=1.0, alpha=1.0):
+    """TikTok's in-app text style: bold text on a tight rounded box."""
+    font = sc.FONT_TT_BOLD
+    f = Fonts.get(font, size)
+    x0, x1 = TextCache.ink(text, font, size)
+    _a, cy0, _b, cy1 = f.getbbox("HXD")          # cap height, ignores descenders
+    w = (x1 - x0) + 0.62 * size
+    h = (cy1 - cy0) + 0.62 * size
+    ctx.save()
+    ctx.translate(x, y)
+    ctx.scale(scale, scale)
+    rounded_rect(ctx, -w / 2, -h / 2, w, h, 0.26 * size)
+    ctx.set_source_rgba(bg[0] / 255, bg[1] / 255, bg[2] / 255, alpha)
+    ctx.fill()
+    TextCache.draw_cap(ctx, text, 0, 0, font, size, color=fg, alpha=alpha)
+    ctx.restore()
 
 
 def draw_timer(ctx, t, remaining, lost, won, cfg, t_free):
-    """Countdown pill: icon + seconds, with a draining fill."""
-    cx, cy = sc.W / 2, 528
-    w, h = 300, 100
-    x0, y0 = cx - w / 2, cy - h / 2
-    frac = clamp01(remaining / sc.TIME_LIMIT)
-    urgent = remaining < 1.0 and not won
-    shake = 0.0
-    if lost:
-        k = t - cfg["t_up"]
-        if k < 0.45:
-            shake = 9 * math.sin(k * 60) * (1 - k / 0.45)
-    elif urgent and cfg.get("tick_from") and t >= cfg["tick_from"]:
-        shake = 2.5 * math.sin(t * 95)
+    """Plain countdown: big digits, red in the last second."""
+    if won:
+        col = TT_GREEN
+    elif lost or remaining < 1.0:
+        col = TT_RED
+    else:
+        col = (255, 255, 255)
+    pop = 1.0
+    if lost and t - cfg["t_up"] < 0.25:
+        pop = 1.0 + 0.25 * (1 - ease_out((t - cfg["t_up"]) / 0.25))
+    if won and t - t_free < 0.3:
+        pop = 1.0 + 0.25 * (1 - ease_out((t - t_free) / 0.3))
     ctx.save()
-    ctx.translate(shake, 0)
-    # small pulse every time a whole second ticks away
-    pulse = 1.0
-    if not won and not lost:
-        since = 1.0 - (remaining % 1.0)
-        if since < 0.18:
-            pulse = 1.0 + 0.08 * (1 - since / 0.18)
-    if lost:
-        k = t - cfg["t_up"]
-        pulse = 1.0 + 0.18 * (1 - ease_out(k / 0.25)) if k < 0.25 else 1.0
-    if won:
-        k = t - t_free
-        pulse = 1.0 + 0.2 * (1 - ease_out(k / 0.3)) if k < 0.3 else 1.0
-
-    if won:
-        base_col = GREEN
-    elif lost or urgent:
-        base_col = RED
-    else:
-        base_col = (1, 1, 1)
-    ctx.translate(cx, cy)
-    ctx.scale(pulse, pulse)
-    ctx.translate(-cx, -cy)
-    # body
-    rounded_rect(ctx, x0, y0, w, h, h / 2)
-    if won:
-        ctx.set_source_rgba(*GREEN, 0.16)
-    elif lost:
-        ctx.set_source_rgba(*RED, 0.22)
-    else:
-        ctx.set_source_rgba(1, 1, 1, 0.06)
-    ctx.fill()
-    # draining bar under the pill
-    bw, bh = 220, 7
-    bx, by = cx - bw / 2, y0 + h + 14
-    rounded_rect(ctx, bx, by, bw, bh, bh / 2)
-    ctx.set_source_rgba(1, 1, 1, 0.12)
-    ctx.fill()
-    if frac > 0:
-        bar_col = GREEN if won else mix((1, 1, 1), RED, clamp01((1.6 - remaining) / 1.0))
-        rounded_rect(ctx, bx, by, max(bh, bw * frac), bh, bh / 2)
-        ctx.set_source_rgba(*bar_col, 0.9)
-        ctx.fill()
-    rounded_rect(ctx, x0 + 1.5, y0 + 1.5, w - 3, h - 3, h / 2)
-    ctx.set_line_width(3)
-    ctx.set_source_rgba(*base_col, 0.55 if (lost or won or urgent) else 0.28)
-    ctx.stroke()
-
-    # icon + digits (tabular figures so the numbers do not wobble)
-    txt = f"{remaining:0.2f}"
-    size = 64
-    col255 = tuple(int(c * 255) for c in base_col)
-    tw = Fonts.get(sc.FONT_BOLD, size).getlength("0.00", features=["tnum"])
-    icon_r = 19
-    gap = 20
-    total = 2 * icon_r + gap + tw
-    left = cx - total / 2
-    if won:
-        draw_check_icon(ctx, left + icon_r, cy, icon_r, GREEN)
-    else:
-        draw_clock_icon(ctx, left + icon_r, cy + 1, icon_r, base_col)
-    TextCache.draw_tnum(ctx, txt, left + 2 * icon_r + gap + tw / 2, cy, sc.FONT_BOLD, size, color=col255)
+    ctx.translate(sc.W / 2, TIMER_Y)
+    ctx.scale(pop, pop)
+    TextCache.draw_tnum(ctx, f"{remaining:0.2f}", 0, 0, sc.FONT_TT_BLACK, 132, color=col)
     ctx.restore()
 
 
@@ -681,10 +652,9 @@ def draw_escaped(ctx, t, t_free):
     k = t - t_free
     if k < 0:
         return
-    a = ease_out(k / 0.2)
-    s = 0.6 + 0.4 * ease_out_back(k / 0.35, 2.2)
-    TextCache.draw(ctx, "ESCAPED!", sc.W / 2, sc.CENTER[1], sc.FONT_BOLD, 128,
-                   color=(70, 236, 130), alpha=a, scale=s, glow=14, glow_color=(40, 220, 110))
+    s = 0.5 + 0.5 * ease_out_back(k / 0.35, 2.2)
+    tiktok_label(ctx, "ESCAPED!", sc.W / 2, sc.CENTER[1], 96, fg=(0, 0, 0), bg=TT_GREEN,
+                 scale=s, alpha=ease_out(k / 0.15))
 
 
 # --------------------------------------------------------------------------
@@ -760,18 +730,18 @@ class EndCard:
         # name
         k = ease_out((t - n0) / (n1 - n0))
         if k > 0:
-            TextCache.draw(ctx, e["name"], self.cx, 795 + 25 * (1 - k), sc.FONT_REGULAR, 128,
+            TextCache.draw(ctx, e["name"], self.cx, 795 + 25 * (1 - k), sc.FONT_TT_BOLD, 128,
                            alpha=k, gradient=((86, 190, 222), (52, 222, 128)))
         # subtitle typing + cursor
         s0, s1 = e["t_type"]
         if t >= s0 - 0.3:
             nchar = int(len(e["subtitle"]) * clamp01((t - s0) / (s1 - s0)))
             shown = e["subtitle"][:nchar]
-            full_w = TextCache.width(e["subtitle"], sc.FONT_REGULAR, 62)
+            full_w = TextCache.width(e["subtitle"], sc.FONT_TT_SEMIBOLD, 62)
             x_left = self.cx - full_w / 2
             if shown:
-                TextCache.draw(ctx, shown, x_left, 905, sc.FONT_REGULAR, 62, anchor="left")
-            cw = TextCache.advance(shown, sc.FONT_REGULAR, 62) if shown else 0
+                TextCache.draw(ctx, shown, x_left, 905, sc.FONT_TT_SEMIBOLD, 62, anchor="left")
+            cw = TextCache.advance(shown, sc.FONT_TT_SEMIBOLD, 62) if shown else 0
             blink = (t < s1) or (int((t - s1) * 2.2) % 2 == 0)
             if blink:
                 ctx.set_source_rgba(1, 1, 1, 0.95)
@@ -806,7 +776,7 @@ class EndCard:
         ctx.set_line_width(3)
         ctx.set_source_rgba(0.55, 1.0, 0.8, 0.7 * a)
         ctx.stroke()
-        TextCache.draw(ctx, self.e["button"], 0, 2, sc.FONT_BOLD, 78, color=(245, 255, 250), alpha=a)
+        TextCache.draw(ctx, self.e["button"], 0, 2, sc.FONT_TT_BOLD, 78, color=(245, 255, 250), alpha=a)
         ctx.restore()
 
 
