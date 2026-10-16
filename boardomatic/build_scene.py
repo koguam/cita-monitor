@@ -435,11 +435,11 @@ FLY_Z = 6.4
 
 def fly_x(f):
     u = clamp((f - FLY0) / (FLY1 - FLY0))
-    return 1.0 + 30.5 * (0.6 * u + 0.4 * smooth(u))
+    return 1.0 + 32.0 * (0.6 * u + 0.4 * smooth(u))
 
 
 # speed profile on the ramp: accelerate up the loop, bleed speed over the top
-ramp_s0 = 33.0 - XSTART
+ramp_s0 = 35.5 - XSTART
 prof = []
 for f in range(DROP1, RAMP1 + 1):
     u = (f - DROP1) / (RAMP1 - DROP1)
@@ -468,7 +468,7 @@ for f in ALL_FRAMES:
         pitch = math.radians(6)
     elif f <= DROP1:
         u = (f - FLY1) / (DROP1 - FLY1)
-        pos = Vector((lerp(31.5, 33.0, u), 0, lerp(FLY_Z, HOVER, smooth(u))))
+        pos = Vector((lerp(33.0, 35.5, u), 0, lerp(FLY_Z, HOVER, smooth(u))))
         pitch = math.radians(6) * (1 - smooth(u))
     elif f <= RAMP1:
         P, T, N = road_at(ramp_s[f])
@@ -638,12 +638,21 @@ for idx, (name, sx, size, col) in enumerate(SLABS):
 
     fi = impact_frame(sx)
     impacts[name] = fi
-    land = fi + 6
-    q_yaw = Quaternion((0, 0, 1), YAW)
-    beta = math.radians(rnd.uniform(-48, -34))
-    q_down = q_yaw @ Quaternion((1, 0, 0), beta) @ Quaternion((0, 1, 0), math.radians(rnd.uniform(-7, 7)))
+    land = fi + 5           # bottom edge hits the asphalt, face cracks
+    flat = land + 8         # tipped over onto its back, logo up
+    q_yaw = Quaternion((0, 0, 1), YAW + math.radians(rnd.uniform(-6, 6)))
     z_float = FLOAT + size / 2
-    z_rest = THICK / 2 * abs(math.sin(beta)) + size / 2 * math.cos(beta) - 0.12
+    # tip over the back bottom edge, which stays put on the asphalt
+    edge = Vector((0, THICK / 2, -size / 2))
+    pivot = Vector((sx, 0, 0)) + q_yaw @ Vector((0, THICK / 2, 0))
+    BETA0, BETA1 = math.radians(-8), math.radians(-90)
+
+    def tipped(beta):
+        q = q_yaw @ Quaternion((1, 0, 0), beta)
+        return pivot - q @ edge, q
+
+    c_land, q_land = tipped(BETA0)
+    q_flat = tipped(BETA1)[1]
     phase = rnd.uniform(0, 6.28)
     twitch = set()
     f = 296 + rnd.randint(0, 8)
@@ -658,17 +667,21 @@ for idx, (name, sx, size, col) in enumerate(SLABS):
             rot.append(q_yaw)
         elif f < land:
             u = (f - fi) / (land - fi)
-            pos.append(Vector((sx, 0, lerp(z_float, z_rest, u * u))))
-            rot.append(q_yaw.slerp(q_down, smooth(u)))
+            pos.append(Vector((sx, 0, z_float)).lerp(c_land, u * u))
+            rot.append(q_yaw.slerp(q_land, u * u))
+        elif f < flat:
+            u = (f - land) / (flat - land)
+            c, q = tipped(lerp(BETA0, BETA1, u * u))
+            pos.append(c)
+            rot.append(q)
         else:
-            k = f - land
-            z = z_rest + (0.2 * math.sin(math.pi * k / 6) if k < 6 else 0)
-            q = q_down
+            k = f - flat
+            c, q = tipped(BETA1 + (math.radians(7) * math.sin(math.pi * k / 5) if k < 5 else 0))
             if f in twitch:
-                z += rnd.uniform(0.0, 0.06)
-                q = q_down @ Quaternion((rnd.uniform(-1, 1), rnd.uniform(-1, 1), rnd.uniform(-1, 1)),
-                                        math.radians(rnd.uniform(1.5, 4)))
-            pos.append(Vector((sx, 0, z)))
+                c = c + Vector((0, 0, rnd.uniform(0.0, 0.06)))
+                q = q @ Quaternion((rnd.uniform(-1, 1), rnd.uniform(-1, 1), rnd.uniform(-1, 1)),
+                                   math.radians(rnd.uniform(1.5, 4)))
+            pos.append(c)
             rot.append(q)
     bake(root, "location", ALL_FRAMES, [tuple(p) for p in pos])
     bake(root, "rotation_quaternion", ALL_FRAMES, [tuple(q) for q in fix_signs(rot)])
@@ -687,6 +700,10 @@ for idx, (name, sx, size, col) in enumerate(SLABS):
 
     hit = Vector((sx, 0, z_float + size * 0.3))
     spawn_chips(hit, land - 1, body_mat, 14, size * 0.35)
+    slam = tipped(BETA1)[0]
+    for k in range(3):
+        spawn_puff(slam + Vector((rnd.uniform(-1.5, 1.5), rnd.uniform(-1.5, 1.5), -0.1)), flat + k,
+                   rnd.uniform(0.5, 0.8), 26, Vector((rnd.uniform(-1, 1), rnd.uniform(-1, 1), 0.5)), M["vapor"])
     for k in range(4):
         spawn_puff(Vector((sx + rnd.uniform(-1, 1), rnd.uniform(-0.6, 0.8), 0.6)), land - 2 + k,
                    rnd.uniform(0.8, 1.3), 34, Vector((rnd.uniform(-1.2, 1.2), rnd.uniform(-0.8, 0.8), 1.6)),
@@ -776,27 +793,14 @@ scene.camera = cams["SH01_Start"]
 
 # one continuous handheld take from the stands
 ema = gpos[0].copy()
-tgt_vals, lens_vals = [], []
+tgt_vals = []
 CENTER = Vector((18, 0, 3))
 for i, f in enumerate(ALL_FRAMES):
     ema = ema.lerp(gpos[i], 0.12)
     tgt_vals.append(tuple(ema.lerp(CENTER, 0.22)))
-    lens = 24.0
-    for fi in impacts.values():
-        k = f - fi
-        if 0 <= k < 3:
-            lens = max(lens, lerp(24, 40, k / 2))
-        elif 3 <= k < 9:
-            lens = max(lens, 40)
-        elif 9 <= k < 17:
-            lens = max(lens, lerp(40, 24, (k - 9) / 8))
-    if 236 <= f < 266:
-        lens = max(lens, lerp(24, 34, smooth((f - 236) / 6)) if f < 252 else lerp(34, 24, (f - 252) / 14))
-    lens_vals.append(lens)
 ot_tgt = empty("TGT_OneTake", tgt_vals[0], size=0.3)
 bake(ot_tgt, "location", ALL_FRAMES, tgt_vals)
 cam_ot = make_cam("CAM_OneTake_Stands", (8.0, -21.0, 6.5), lens=24, shake=0.012, track=ot_tgt)
-bake(cam_ot.data, "lens", ALL_FRAMES, lens_vals)
 
 
 # ---------------------------------------------------------------- render setup
@@ -826,7 +830,7 @@ def setup_render(sc):
     r.use_stamp_lens = True
     r.use_stamp_camera = r.use_stamp_frame = r.use_stamp_note = True
     r.use_stamp_scene = False
-    r.stamp_note_text = "GENORA - grey boardomatic v1"
+    r.stamp_note_text = "GENORA - grey boardomatic v2"
     r.stamp_font_size = 26
     r.stamp_background = (0, 0, 0, 0.6)
     if sc.world is None:
